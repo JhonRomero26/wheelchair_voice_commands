@@ -1,0 +1,49 @@
+[project]
+name = "voice-commands"
+version = "0.1.0"
+authors = [
+    { name = "Jhon Romero", email = "romerogonzaga21@gmail.com" }
+]
+description = "A TensorFlow based microwakeword training framework using synthetic sample generation suitable for certain microcontrollers."
+readme = "README.md"
+requires-python = ">=3.9,<3.10"
+dependencies = [
+    "audio-metadata",
+    "audiomentations>=0.42.0",
+    "datasets>=3.6.0",
+    "ipykernel>=6.30.1",
+    "kagglehub>=0.3.13",
+    "mmap-ninja>=0.7.4",
+    "numpy>=2.0.2",
+    "pymicro-features",
+    "pyyaml>=6.0.2",
+    "scipy>=1.13.1",
+    "seaborn>=0.13.2",
+    "tensorflow>=2.20.0",
+    "torch>=2.8.0",
+    "torchcodec>=0.6.0",
+    "tqdm>=4.67.1",
+    "webrtcvad-wheels>=2.0.14",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/JhonRomero26/wheelchairAI"
+Issues = "https://github.com/JhonRomero26/wheelchairAI/issues"
+
+[tool.back]
+target-version = ["py39"]
+exclude = 'generated'
+
+[tool.uv.sources]
+pymicro-features = { git = "https://github.com/puddly/pymicro-features", rev = "puddly/minimum-cpp-version" }
+audio-metadata = { git = "https://github.com/whatsnowplaying/audio-metadata", rev = "d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f" }
+
+[dependency-groups]
+dev = [
+    "ipywidgets>=8.1.7",
+]

@@ -1,0 +1,110 @@
+batch_size: 128
+clip_duration_ms: 1500
+eval_step_interval: 500
+features:
+- features_dir: commands_augmented/negative/speech
+  label: 0
+  penalty_weight: 1.0
+  sampling_weight: 10.0
+  truncation_strategy: truncate_end
+  truth: false
+  type: mmap
+- features_dir: commands_augmented/negative/dinner_party
+  label: 0
+  penalty_weight: 1.0
+  sampling_weight: 10.0
+  truncation_strategy: truncate_end
+  truth: false
+  type: mmap
+- features_dir: commands_augmented/negative/no_speech
+  label: 0
+  penalty_weight: 1.0
+  sampling_weight: 5.0
+  truncation_strategy: truncate_end
+  truth: false
+  type: mmap
+- features_dir: commands_augmented/commands/adelante
+  label: 1
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: truncate_start
+  truth: true
+  type: mmap
+- features_dir: commands_augmented/commands/atras
+  label: 2
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: truncate_start
+  truth: true
+  type: mmap
+- features_dir: commands_augmented/commands/derecha
+  label: 3
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: truncate_start
+  truth: true
+  type: mmap
+- features_dir: commands_augmented/commands/frena
+  label: 4
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: truncate_start
+  truth: true
+  type: mmap
+- features_dir: commands_augmented/commands/izquierda
+  label: 5
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: truncate_start
+  truth: true
+  type: mmap
+- features_dir: commands_augmented/commands/lento
+  label: 6
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: truncate_start
+  truth: true
+  type: mmap
+- features_dir: commands_augmented/commands/moderado
+  label: 7
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: truncate_start
+  truth: true
+  type: mmap
+- features_dir: commands_augmented/commands/rapido
+  label: 8
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: truncate_start
+  truth: true
+  type: mmap
+- features_dir: commands_augmented/commands/reversa
+  label: 9
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: truncate_start
+  truth: true
+  type: mmap
+freq_mask_count:
+- 0
+freq_mask_max_size:
+- 0
+learning_rates:
+- 0.001
+maximization_metric: average_viable_recall
+minimization_metric: null
+negative_class_weight:
+- 20
+num_classes: 10
+positive_class_weight:
+- 1
+target_minimization: 0.9
+time_mask_count:
+- 0
+time_mask_max_size:
+- 0
+train_dir: trained
+training_steps:
+- 20000
+window_step_ms: 10

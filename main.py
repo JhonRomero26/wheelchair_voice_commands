@@ -223,32 +223,6 @@ def evaluate_model(
             }
         )
 
-    if test_tflite_streaming:
-        tflite_configs.append(
-            {
-                "log_string": "streaming model",
-                "source_folder": "stream_state_internal",
-                "output_folder": "tflite_stream_state_internal",
-                "filename": "stream_state_internal.tflite",
-                "testing_dataset": "testing",
-                "testing_ambient_dataset": "testing_ambient",
-                "quantize": False,
-            }
-        )
-
-    if test_tflite_streaming_quantized:
-        tflite_configs.append(
-            {
-                "log_string": "quantized streaming model",
-                "source_folder": "stream_state_internal",
-                "output_folder": "tflite_stream_state_internal_quant",
-                "filename": "stream_state_internal_quant.tflite",
-                "testing_dataset": "testing",
-                "testing_ambient_dataset": "testing_ambient",
-                "quantize": True,
-            }
-        )
-
     for tflite_config in tflite_configs:
         logging.info("Converting %s to TFLite", tflite_config["log_string"])
 
@@ -266,14 +240,14 @@ def evaluate_model(
             tflite_config["log_string"],
         )
 
-        test.tflite_streaming_model_roc(
+        test.tflite_model_accuracy(
             config,
             tflite_config["output_folder"],
             data_processor,
             data_set=tflite_config["testing_dataset"],
-            ambient_set=tflite_config["testing_ambient_dataset"],
+            # ambient_set=tflite_config["testing_ambient_dataset"],
             tflite_model_name=tflite_config["filename"],
-            accuracy_name="tflite_streaming_roc.txt",
+            accuracy_name="tflite_model_accuracy.txt",
         )
 
 

@@ -313,7 +313,9 @@ def convert_saved_model_to_tflite(
         ] = 26.0  # guarantee one pixel is the preprocessor max
 
         for spectrogram in sample_fingerprints:
-            yield spectrogram
+            # Asegúrate de expandir dimensión batch si falta
+            spectrogram = np.expand_dims(spectrogram, axis=0).astype(np.float32)
+            yield [spectrogram]
 
         # stride = config["stride"]
 

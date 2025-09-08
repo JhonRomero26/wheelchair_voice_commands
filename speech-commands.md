@@ -25,9 +25,9 @@ from absl import logging
 from pathlib import Path
 from mmap_ninja.ragged import RaggedMmap
 
-from microwakeword.audio.clips import Clips
-from microwakeword.audio.augmentation import Augmentation
-from microwakeword.audio.spectrograms import SpectrogramGeneration
+from speech_commands.audio.clips import Clips
+from speech_commands.audio.augmentation import Augmentation
+from speech_commands.audio.spectrograms import SpectrogramGeneration
 
 
 def spec_augment(
@@ -622,7 +622,7 @@ class FeatureHandler(object):
 from typing import Optional
 import numpy as np
 import tensorflow as tf
-from microwakeword.audio.audio_utils import generate_features_for_clip
+from speech_commands.audio.audio_utils import generate_features_for_clip
 
 
 class Model:
@@ -792,8 +792,8 @@ class Model:
 
 """Model based on 1D depthwise MixedConvs and 1x1 convolutions in time + residual."""
 
-from microwakeword.layers import stream
-from microwakeword.layers import strided_drop
+from speech_commands.layers import stream
+from speech_commands.layers import strided_drop
 
 import ast
 import tensorflow as tf
@@ -976,11 +976,7 @@ class MixConv:
         #   - There is some latency overhead on the esp devices for loading each ring buffer's data
         #   - This avoids variable's holding redundant information
         #   - Reduces the necessary size of the tensor arena
-        net = stream.Stream(
-            cell=tf.keras.layers.Identity(),
-            ring_buffer_size_in_time_dim=self.ring_buffer_length,
-            use_one_step=False,
-        )(inputs)
+        net = inputs
 
         if len(self.kernel_sizes) == 1:
             return tf.keras.layers.DepthwiseConv2D(
@@ -1006,50 +1002,6 @@ class MixConv:
 
         x = tf.keras.layers.concatenate(x_outputs, axis=self._channel_axis)
         return x
-
-
-class SpatialAttention:
-    """Spatial Attention Layer based on CBAM: Convolutional Block Attention Module
-    https://arxiv.org/pdf/1807.06521v2
-
-    Args:
-        object (_type_): _description_
-    """
-
-    def __init__(self, kernel_size, ring_buffer_size):
-        self.kernel_size = kernel_size
-        self.ring_buffer_size = ring_buffer_size
-
-    def __call__(self, inputs):
-        tranposed = tf.keras.ops.transpose(inputs, axes=[0, 1, 3, 2])
-        channel_avg = tf.keras.layers.AveragePooling2D(
-            pool_size=(1, tranposed.shape[2]), strides=(1, tranposed.shape[2])
-        )(tranposed)
-        channel_max = tf.keras.layers.MaxPooling2D(
-            pool_size=(1, tranposed.shape[2]), strides=(1, tranposed.shape[2])
-        )(tranposed)
-        pooled = tf.keras.layers.Concatenate(axis=-1)([channel_avg, channel_max])
-
-        attention = stream.Stream(
-            cell=tf.keras.layers.Conv2D(
-                1,
-                (self.kernel_size, 1),
-                strides=(1, 1),
-                padding="valid",
-                use_bias=False,
-                activation="sigmoid",
-            ),
-            use_one_step=False,
-        )(pooled)
-
-        net = stream.Stream(
-            cell=tf.keras.layers.Identity(),
-            ring_buffer_size_in_time_dim=self.ring_buffer_size,
-            use_one_step=False,
-        )(inputs)
-        net = net[:, -attention.shape[1] :, :, :]
-
-        return net * attention
 
 
 def model(flags, shape, batch_size, num_classes=2):
@@ -1090,23 +1042,6 @@ def model(flags, shape, batch_size, num_classes=2):
     # make it [batch, time, 1, feature]
     net = tf.keras.ops.expand_dims(net, axis=2)
 
-    # Streaming Conv2D with 'valid' padding
-    if flags.first_conv_filters > 0:
-        net = stream.Stream(
-            cell=tf.keras.layers.Conv2D(
-                flags.first_conv_filters,
-                (flags.first_conv_kernel_size, 1),
-                strides=(flags.stride, 1),
-                padding="valid",
-                use_bias=False,
-            ),
-            use_one_step=False,
-            pad_time_dim=None,
-            pad_freq_dim="valid",
-        )(net)
-
-        net = tf.keras.layers.Activation("relu")(net)
-
     # encoder
     for filters, repeat, ksize, res in zip(
         pointwise_filters,
@@ -1137,18 +1072,6 @@ def model(flags, shape, batch_size, num_classes=2):
             net = tf.keras.layers.Activation("relu")(net)
 
     if net.shape[1] > 1:
-        if flags.spatial_attention:
-            net = SpatialAttention(
-                kernel_size=4,
-                ring_buffer_size=net.shape[1] - 1,
-            )(net)
-        else:
-            net = stream.Stream(
-                cell=tf.keras.layers.Identity(),
-                ring_buffer_size_in_time_dim=net.shape[1] - 1,
-                use_one_step=False,
-            )(net)
-
         if flags.pooled:
             # We want to use either Global Max Pooling or Global Average Pooling, but the esp-nn operator optimizations only benefit regular pooling operations
 
@@ -1157,7 +1080,7 @@ def model(flags, shape, batch_size, num_classes=2):
             else:
                 net = tf.keras.layers.AveragePooling2D(pool_size=(net.shape[1], 1))(net)
 
-    # net = tf.keras.layers.Flatten()(net)
+    net = tf.keras.layers.Flatten()(net)
     net = tf.keras.layers.Dense(num_classes, activation="softmax")(net)
 
     return tf.keras.Model(input_audio, net)
@@ -1188,70 +1111,103 @@ import numpy as np
 import tensorflow as tf
 import seaborn as sns
 import matplotlib.pyplot as plt
+import yaml
 
 from absl import logging
 from typing import List
-from microwakeword.inference import Model
+from speech_commands.inference import Model
 from numpy.lib.stride_tricks import sliding_window_view
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+from sklearn.preprocessing import label_binarize
 
 
 def get_classes(config):
-    labels = os.listdir(config["commands_dir"])
-    class_names = {idx + 1: label for idx, label in enumerate(labels)}
-    class_names[0] = "Inaplicable"
+    labels = config["labels"]
+    labels["Sin detección"] = 0
+    del labels["negative"]
+        
+    class_names = {v: k for k, v in labels.items()}
     return class_names
 
 
 
-def plot_confusion_matrix(confusion_mat, class_names):
+def plot_confusion_matrix(confusion_mat, class_names, figsize=(10, 8), cmap="Blues", save_path=None):
     """
-    Visualiza la matriz de confusión con nombres de clases.
-    
+    Visualiza la matriz de confusión de manera moderna con Seaborn.
+
     Args:
         confusion_mat (np.ndarray): Matriz de confusión.
         class_names (dict): Diccionario que mapea índices a nombres de clases.
+        figsize (tuple, optional): Tamaño de la figura. Default (10, 8).
+        cmap (str, optional): Colormap de Seaborn. Default "Blues".
+        save_path (str, optional): Ruta para guardar la imagen. Si None, no se guarda.
     """
     # Convertir los índices a nombres de clases
     class_labels = [class_names[i] for i in range(len(class_names))]
 
-    # Visualizar la matriz de confusión
-    plt.figure(figsize=(10, 8))
+    # Normalizar para mostrar porcentajes
+    confusion_norm = confusion_mat.astype('float') / (confusion_mat.sum(axis=1)[:, np.newaxis] + 1e-9)
+
+    plt.figure(figsize=figsize)
     sns.heatmap(
-        confusion_mat,
-        annot=True,
+        confusion_norm,
+        annot=confusion_mat,  # Mostrar los conteos reales
         fmt="d",
-        cmap="Blues",
-        cbar=False,
-        xticklabels=class_labels,  # Etiquetas del eje x
-        yticklabels=class_labels,  # Etiquetas del eje y
+        cmap=cmap,
+        cbar=True,
+        xticklabels=class_labels,
+        yticklabels=class_labels,
     )
-    plt.xlabel("Clases Predichas")
-    plt.ylabel("Clases Verdaderas")
-    plt.title("Matriz de Confusión")
-    plt.xticks(rotation=45)  # Rotar etiquetas si son largas
+
+    plt.title("Matriz de Confusión", fontsize=16, weight="bold")
+    plt.xlabel("Clases Predichas", fontsize=12)
+    plt.ylabel("Clases Verdaderas", fontsize=12)
+    plt.xticks(rotation=45, ha="right")
     plt.yticks(rotation=0)
-    plt.savefig("confusion_matrix.png")
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300)
     plt.show()
 
+def generate_roc_curve(y_true, y_scores, class_names, output_dir=None):
+    y_true = np.array(y_true)
+    n_classes = len(class_names)
+    y_bin = label_binarize(y_true, classes=list(range(n_classes)))
 
-def compute_metrics_from_confusion(confusion_mat):
-    """
-    Calcula métricas globales (precisión, recall, etc.) desde una matriz de confusión.
-    """
-    true_positives = np.diag(confusion_mat)
-    false_positives = np.sum(confusion_mat, axis=0) - true_positives
-    false_negatives = np.sum(confusion_mat, axis=1) - true_positives
+    fpr_list = []
+    tpr_list = []
+    roc_auc_list = []
+    
+    for i in range(n_classes):
+        fpr, tpr, _ = roc_curve(y_bin[:, i], y_scores[:, i])
+        fpr_list.append(fpr)
+        tpr_list.append(tpr)
+        roc_auc_list.append(auc(fpr, tpr))
 
-    precision = np.mean(true_positives / (true_positives + false_positives + 1e-9))
-    recall = np.mean(true_positives / (true_positives + false_negatives + 1e-9))
-    accuracy = np.sum(true_positives) / np.sum(confusion_mat)
+    return fpr_list, tpr_list, roc_auc_list
 
-    return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-    }
+def plot_roc_curve(y_true, y_scores, class_names, figsize=(10, 8), save_path=None):
+    roc_curves = generate_roc_curve(y_true, y_scores, class_names)
+    fpr_list, tpr_list, roc_auc_list = roc_curves
+
+    for i in range(len(roc_auc_list)):
+        plt.plot(fpr_list[i], tpr_list[i], label=f'{class_names[i]} (AUC = {roc_auc_list[i]:.2f})')
+
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc="lower right")
+    plt.grid(True)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+    plt.show()
+
 
 def save_confusion_matrix(confusion_mat, class_names, file_path):
     """
@@ -1272,272 +1228,6 @@ def save_confusion_matrix(confusion_mat, class_names, file_path):
         for i, row in enumerate(confusion_mat):
             f.write(f"{class_labels[i]}\t" + "\t".join(map(str, row)) + "\n")
 
-
-def compute_metrics_multiclass(confusion_mat):
-    """
-    Calcula métricas globales y por clase a partir de una matriz de confusión multiclase.
-    
-    Args:
-        confusion_mat (np.ndarray): Matriz de confusión de tamaño (num_classes x num_classes).
-    
-    Returns:
-        dict: Diccionario con métricas globales y por clase.
-    """
-    num_classes = confusion_mat.shape[0]
-    true_positives = np.diag(confusion_mat)  # Diagonal contiene los verdaderos positivos
-    false_positives = np.sum(confusion_mat, axis=0) - true_positives  # Suma por columnas
-    false_negatives = np.sum(confusion_mat, axis=1) - true_positives  # Suma por filas
-    true_negatives = np.sum(confusion_mat) - (true_positives + false_positives + false_negatives)
-
-    # Métricas por clase
-    precision_per_class = true_positives / (true_positives + false_positives + 1e-9)
-    recall_per_class = true_positives / (true_positives + false_negatives + 1e-9)
-    f1_score_per_class = (
-        2 * precision_per_class * recall_per_class / (precision_per_class + recall_per_class + 1e-9)
-    )
-
-    # Métricas globales
-    accuracy = np.sum(true_positives) / np.sum(confusion_mat)
-    precision_macro = np.mean(precision_per_class)
-    recall_macro = np.mean(recall_per_class)
-    f1_score_macro = np.mean(f1_score_per_class)
-
-    return {
-        "accuracy": accuracy,
-        "precision_macro": precision_macro,
-        "recall_macro": recall_macro,
-        "f1_score_macro": f1_score_macro,
-        "precision_per_class": precision_per_class,
-        "recall_per_class": recall_per_class,
-        "f1_score_per_class": f1_score_per_class,
-    }
-
-def compute_metrics(true_positives, true_negatives, false_positives, false_negatives):
-    """Utility function to compute various metrics.
-
-    Arguments:
-        true_positives: Count of samples correctly predicted as positive
-        true_negatives: Count of samples correctly predicted as negative
-        false_positives: Count of samples incorrectly predicted as positive
-        false_negatives: Count of samples incorrectly predicted as negative
-
-    Returns:
-        metric dictionary with keys for `accuracy`, `recall`, `precision`, `false_positive_rate`, `false_negative_rate`, and `count`
-    """
-
-    accuracy = float("nan")
-    false_positive_rate = float("nan")
-    false_negative_rate = float("nan")
-    recall = float("nan")
-    precision = float("nan")
-
-    count = true_positives + true_negatives + false_positives + false_negatives
-
-    if true_positives + true_negatives + false_positives + false_negatives > 0:
-        accuracy = (true_positives + true_negatives) / count
-
-    if false_positives + true_negatives > 0:
-        false_positive_rate = false_positives / (false_positives + true_negatives)
-
-    if true_positives + false_negatives > 0:
-        false_negative_rate = false_negatives / (true_positives + false_negatives)
-        recall = true_positives / (true_positives + false_negatives)
-
-    if (true_positives + false_positives) > 0:
-        precision = true_positives / (true_positives + false_positives)
-
-    return {
-        "accuracy": accuracy,
-        "recall": recall,
-        "precision": precision,
-        "false_positive_rate": false_positive_rate,
-        "false_negative_rate": false_negative_rate,
-        "count": count,
-    }
-
-
-def metrics_to_string(metrics):
-    """Utility function to return a string that describes various metrics.
-
-    Arguments:
-        metrics: metric dictionary with keys for `accuracy`, `recall`, `precision`, `false_positive_rate`, `false_negative_rate`, and `count`
-
-    Returns:
-        string describing the given metrics
-    """
-
-    return "accuracy = {accuracy:.4%}; recall = {recall:.4%}; precision = {precision:.4%}; fpr = {fpr:.4%}; fnr = {fnr:.4%}; (N={count})".format(
-        accuracy=metrics["accuracy"],
-        recall=metrics["recall"],
-        precision=metrics["precision"],
-        fpr=metrics["false_positive_rate"],
-        fnr=metrics["false_negative_rate"],
-        count=metrics["count"],
-    )
-
-
-def compute_false_accepts_per_hour(
-    streaming_probabilities_list: List[np.ndarray],
-    cutoffs: np.array,
-    ignore_slices_after_accept: int = 75,
-    stride: int = 1,
-    step_s: float = 0.02,
-):
-    """Computes the false accept per hour rates at various cutoffs given a list of streaming probabilities.
-
-    Args:
-        streaming_probabilities_list (List[numpy.ndarray]): A list containing streaming probabilities from negative audio clips
-        cutoffs (numpy.array): An array of cutoffs/thresholds to test the false accpet rate at.
-        ignore_slices_after_accept (int, optional): The number of probabililities slices to ignore after a false accept. Defaults to 75.
-        stride (int, optional): The stride of the input layer. Defaults to 1.
-        step_s (float, optional): The duration between each probabilitiy in seconds. Defaults to 0.02.
-
-    Returns:
-        numpy.ndarray: The false accepts per hour corresponding to thresholds in `cutoffs`.
-    """
-    cutoffs_count = cutoffs.shape[0]
-
-    false_accepts_at_cutoffs = np.zeros(cutoffs_count)
-    probabilities_duration_h = 0
-
-    for track_probabilities in streaming_probabilities_list:
-        probabilities_duration_h += len(track_probabilities) * stride * step_s / 3600.0
-
-        cooldown_at_cutoffs = np.ones(cutoffs_count) * ignore_slices_after_accept
-
-        for wakeword_probability in track_probabilities:
-            # Decrease the cooldown cutoff by 1 with a minimum value of 0
-            cooldown_at_cutoffs = np.maximum(
-                cooldown_at_cutoffs - 1, np.zeros(cutoffs_count)
-            )
-            detection_boolean = (
-                wakeword_probability > cutoffs
-            )  # a list of detection states at each cutoff
-
-            for index in range(cutoffs_count):
-                if cooldown_at_cutoffs[index] == 0 and detection_boolean[index]:
-                    false_accepts_at_cutoffs[index] += 1
-                    cooldown_at_cutoffs[index] = ignore_slices_after_accept
-
-    return false_accepts_at_cutoffs / probabilities_duration_h
-
-
-def generate_roc_curve(
-    false_accepts_per_hour: np.ndarray,
-    false_rejections: np.ndarray,
-    # positive_samples_probabilities: np.ndarray,
-    cutoffs: np.ndarray,
-    max_faph: float = 2.0,
-):
-    """Generates the coordinates for an ROC curve plotting false accepts per hour vs false rejections. Computes the false rejection rate at the specifiied cutoffs.
-
-    Args:
-        false_accepts_per_hour (numpy.ndarray): False accepts per hour rates for each threshold in `cutoffs`.
-        false_rejections (numpy.ndarray): False rejection rates for each threshold in `cutoffs`.
-        cutoffs (numpy.ndarray): Thresholds used for `false_ccepts_per_hour`
-        max_faph (float, optional): The maximum false accept per hour rate to include in curve's coordinates. Defaults to 2.0.
-
-    Returns:
-        (numpy.ndarray, numpy.ndarray, numpy.ndarray): (false accept per hour coordinates, false rejection rate coordinates, cutoffs for each coordinate)
-    """
-
-    if false_accepts_per_hour[0] > max_faph:
-        # Use linear interpolation to estimate false negative rate at max_faph
-
-        # Increase the index until we find a faph less than max_faph
-        index_of_first_viable = 1
-        while false_accepts_per_hour[index_of_first_viable] > max_faph:
-            index_of_first_viable += 1
-
-        x0 = false_accepts_per_hour[index_of_first_viable - 1]
-        y0 = false_rejections[index_of_first_viable - 1]
-        x1 = false_accepts_per_hour[index_of_first_viable]
-        y1 = false_rejections[index_of_first_viable - 1]
-
-        fnr_at_max_faph = (y0 * (x1 - 2.0) + y1 * (2.0 - x0)) / (x1 - x0)
-        cutoff_at_max_faph = (
-            cutoffs[index_of_first_viable] + cutoffs[index_of_first_viable - 1]
-        ) / 2.0
-    else:
-        # Smallest faph is less than max_faph, so assume the false negative rate is constant
-        index_of_first_viable = 0
-        fnr_at_max_faph = false_rejections[index_of_first_viable]
-        cutoff_at_max_faph = cutoffs[index_of_first_viable]
-
-    horizontal_coordinates = [max_faph]
-    vertical_coordinates = [fnr_at_max_faph]
-    cutoffs_at_coordinate = [cutoff_at_max_faph]
-
-    for index in range(index_of_first_viable, len(false_rejections)):
-        if false_accepts_per_hour[index] != horizontal_coordinates[-1]:
-            # Only add a point if it is a new faph
-            # This ensures if a faph rate is repeated, we use the small false negative rate
-            horizontal_coordinates.append(false_accepts_per_hour[index])
-            vertical_coordinates.append(false_rejections[index])
-            cutoffs_at_coordinate.append(cutoffs[index])
-
-    if horizontal_coordinates[-1] > 0:
-        # If there isn't a cutoff with 0 faph, then add a coordinate at (0,1)
-        horizontal_coordinates.append(0.0)
-        vertical_coordinates.append(1.0)
-        cutoffs_at_coordinate.append(0.0)
-
-    # The points on the curve are listed in descending order, flip them before returning
-    horizontal_coordinates = np.flip(horizontal_coordinates)
-    vertical_coordinates = np.flip(vertical_coordinates)
-    cutoffs_at_coordinate = np.flip(cutoffs_at_coordinate)
-    return horizontal_coordinates, vertical_coordinates, cutoffs_at_coordinate
-
-
-import librosa
-import numpy as np
-
-def mel_to_audio(mel_spectrogram, sr=16000, n_fft=512, step_ms=10, n_mels=40):
-    """
-    Convierte un espectrograma Mel en una señal de audio.
-    
-    Args:
-        mel_spectrogram (np.ndarray): Espectrograma Mel (shape: [tiempo, n_mels] o [n_mels, tiempo]).
-        sr (int): Tasa de muestreo del audio original.
-        n_fft (int): Tamaño de la ventana FFT.
-        step_ms (int): Desplazamiento entre ventanas consecutivas (en milisegundos).
-        n_mels (int): Número de bandas Mel.
-    
-    Returns:
-        np.ndarray: Señal de audio reconstruida.
-    """
-    # Calcular hop_length a partir de step_ms
-    # hop_length = int(step_ms * sr / 1000)
-    hop_length = mel_spectrogram.shape[0]
-
-    if mel_spectrogram.shape[1] == n_mels:  # Si la segunda dimensión es n_mels
-        mel_spectrogram = mel_spectrogram.T  # Transponer el tensor
-    print("Forma del espectrograma Mel ajustado:", mel_spectrogram.shape)
-
-    # Crear la matriz de filtro Mel inversa
-    mel_basis = librosa.filters.mel(
-        sr=sr,
-        n_fft=n_fft,
-        n_mels=n_mels,
-        fmin=125,  # Límite inferior de frecuencia
-        fmax=7500,  # Límite superior de frecuencia
-    )
-    mel_inverse = np.linalg.pinv(mel_basis)
-
-    # Convertir características Mel a espectrograma de magnitud
-    magnitude_spectrogram = np.dot(mel_inverse, mel_spectrogram)
-
-    # Aplicar Griffin-Lim para reconstruir la fase
-    audio_signal = librosa.griffinlim(
-        magnitude_spectrogram,
-        n_iter=10,  # Número de iteraciones para Griffin-Lim
-        hop_length=hop_length,
-        win_length=n_fft
-    )
-
-    return audio_signal
-
-
 def tf_model_accuracy(
     config,
     folder,
@@ -1545,64 +1235,80 @@ def tf_model_accuracy(
     data_set="testing",
     accuracy_name="tf_model_accuracy.txt",
 ):
+    class_names = get_classes(config)
+
     # Obtener datos de prueba
-    test_fingerprints, test_ground_truth, _ = audio_processor.get_data(
+    test_x, test_y, _ = audio_processor.get_data(
         data_set,
         batch_size=config["batch_size"],
         features_length=config["spectrogram_length"],
         truncation_strategy="truncate_start",
     )
 
-    class_names = get_classes(config)
 
     with tf.device("/cpu:0"):
         # Cargar el modelo TensorFlow guardado
         model = tf.saved_model.load(os.path.join(config["train_dir"], folder))
-        inference_batch_size = 1
-
         infer = model.signatures["serving_default"]
 
         # Listas para almacenar etiquetas verdaderas y predicciones
-        y_true = []
-        y_pred = []
+        y_true, y_pred = [], []
+        for i, sample in enumerate(test_x):
+            tensor = tf.convert_to_tensor(sample[np.newaxis, ...], dtype=tf.float32)
+            result = infer(tensor)
+            probs = result["output"].numpy()[0]
+            y_pred.append(np.argmax(probs))
+            y_true.append(int(test_y[i]))
 
-
-        for i in range(0, len(test_fingerprints)):
-            spectrogram_features = test_fingerprints[i : i + inference_batch_size]  # Tomar una muestra
-            spectrogram_tensor = tf.convert_to_tensor(spectrogram_features, dtype=tf.float32)
-            sample_ground_truth = int(test_ground_truth[i])
-
-
-            result = infer(spectrogram_tensor)
-            probabilities = result['output_0'].numpy()[0]  # Probabilidades para cada clase
-            predicted_class = np.argmax(probabilities)  # Clase con mayor probabilidad
-            
-            # Almacenar etiquetas verdaderas y predicciones
-            y_true.append(sample_ground_truth)
-            y_pred.append(predicted_class)
-
-            # Registro intermedio (opcional)
             if i % 1000 == 0 and i:
-                logging.info(f"Procesando muestra {i} de {len(test_fingerprints)}")
+                logging.info(f"Procesando muestra {i} de {len(test_x)}")
+
+    y_score = []
+    for sample in test_x:
+        spectrogram = sample.astype(np.float32)
+        probs = model.predict_spectrogram(spectrogram)
+        if probs.ndim == 2:
+            probs = np.mean(probs, axis=0)
+        y_score.append(probs)
     
+    y_score = np.array(y_score)
+    plot_roc_curve(
+        y_true, y_score,
+        class_names,
+        save_path=os.path.join(config["train_dir"],
+                               folder, "roc_curve.png"))
 
     # Calcular la matriz de confusión
     confusion_mat = confusion_matrix(y_true, y_pred)
-
-    # Visualizar la matriz de confusión
     plot_confusion_matrix(confusion_mat, class_names)
+    report = classification_report(
+        y_true, y_pred,
+        target_names=list(class_names.values()),
+        zero_division=0,
+        output_dict=True)
 
+    accuracy = report["accuracy"]
 
-    # Guardar resultados
-    metrics_string = compute_metrics_from_confusion(confusion_mat)
-    logging.info("Final TensorFlow model on the " + data_set + " set: " + metrics_string)
     path = os.path.join(config["train_dir"], folder)
     with open(os.path.join(path, accuracy_name), "wt") as fd:
-        fd.write(metrics_string + "\n")
-        fd.write("Matriz de confusión:\n")
-        np.savetxt(fd, confusion_mat, fmt="%d")
+        fd.write(f"Accuracy: {accuracy:.4f}\n\n")
+    
+    with open(os.path.join(path, "classification_report.csv"), "wt") as fd:
+        fd.write("label,precision,recall,f1-score\n")
+        for label in class_names.values():
+            if label in report:
+                m = report[label]
+                fd.write(f"{label},{m['precision']:.4f},{m['recall']:.4f},{m['f1-score']:.4f}\n")
+    
+    with open(os.path.join(path, "confusion_matrix.csv"), "wt") as fd:
+        for i in range(confusion_mat.shape[0]):
+            for j in range(confusion_mat.shape[1]):
+                fd.write(f"{confusion_mat[i, j]} ")
+            fd.write("\n")
+        
+    logging.info(f"Accuracy final en {data_set}: {accuracy:.4f}")
 
-    return compute_metrics_from_confusion(confusion_mat)
+    return {"accuracy": accuracy, "report": report, "confusion_matrix": confusion_mat}
 
 
 def tflite_streaming_model_roc(
@@ -1614,7 +1320,6 @@ def tflite_streaming_model_roc(
     tflite_model_name="stream_state_internal.tflite",
     accuracy_name="tflite_streaming_roc.txt",
     sliding_window_length=5,
-    ignore_slices_after_accept=25,
 ):
     """Function to test a tflite model false accepts per hour and false rejection rates.
 
@@ -1646,25 +1351,14 @@ def tflite_streaming_model_roc(
     )
 
     logging.info("Testing the " + ambient_set + " set.")
-    ambient_streaming_probabilities = []
-    for spectrogram_track in test_ambient_fingerprints:
-        streaming_probabilities = model.predict_spectrogram(spectrogram_track)
-        sliding_window_probabilities = sliding_window_view(
-            streaming_probabilities, sliding_window_length
-        )
-        moving_average = sliding_window_probabilities.mean(axis=-1)
-        ambient_streaming_probabilities.append(moving_average)
-
-    cutoffs = np.arange(0, 1.01, 0.01)
-    # ignore_slices_after_accept = 25
-
-    faph = compute_false_accepts_per_hour(
-        ambient_streaming_probabilities,
-        cutoffs,
-        ignore_slices_after_accept,
-        stride=config["stride"],
-        step_s=config["window_step_ms"] / 1000,
-    )
+    ambient_preds = []
+    for spectrogram in test_ambient_fingerprints:
+        probs = model.predict_spectrogram(spectrogram)  # (frames, num_classes)
+        if probs.ndim == 2:  # suavizado temporal
+            sw = sliding_window_view(probs, (sliding_window_length, probs.shape[1]), axis=(0, 1))
+            moving_avg = sw.mean(axis=(2, 3))  # promedio sobre ventana
+            probs = moving_avg
+        ambient_preds.append(np.mean(probs, axis=0))  # promedio global
 
     test_fingerprints, test_ground_truth, _ = audio_processor.get_data(
         data_set,
@@ -1674,49 +1368,28 @@ def tflite_streaming_model_roc(
     )
 
     logging.info("Testing the " + data_set + " set.")
-
-    positive_sample_streaming_probabilities = []
+    y_true, y_pred = [], []
     for i in range(len(test_fingerprints)):
-        if test_ground_truth[i]:
-            # Only test positive samples
-            streaming_probabilities = model.predict_spectrogram(test_fingerprints[i])
-            sliding_window_probabilities = sliding_window_view(
-                streaming_probabilities[ignore_slices_after_accept:],
-                sliding_window_length,
-            )
-            moving_average = sliding_window_probabilities.mean(axis=-1)
-            positive_sample_streaming_probabilities.append(np.max(moving_average))
+        probs = model.predict_spectrogram(test_fingerprints[i])
+        if probs.ndim == 2:
+            sw = sliding_window_view(probs, (sliding_window_length, probs.shape[1]), axis=(0, 1))
+            moving_avg = sw.mean(axis=(2, 3))
+            probs = moving_avg
+        mean_probs = np.mean(probs, axis=0)
+        y_pred.append(np.argmax(mean_probs))
+        y_true.append(test_ground_truth[i])
 
-    # Compute the false negative rates at each cutoff
-    false_negative_rate_at_cutoffs = []
-    for cutoff in cutoffs:
-        true_accepts = sum(i > cutoff for i in positive_sample_streaming_probabilities)
-        false_negative_rate_at_cutoffs.append(
-            1 - true_accepts / len(positive_sample_streaming_probabilities)
-        )
-
-    x_coordinates, y_coordinates, cutoffs_at_points = generate_roc_curve(
-        false_accepts_per_hour=faph,
-        false_rejections=false_negative_rate_at_cutoffs,
-        cutoffs=cutoffs,
-    )
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    accuracy = np.mean(y_true == y_pred)
 
     path = os.path.join(config["train_dir"], folder)
     with open(os.path.join(path, accuracy_name), "wt") as fd:
-        auc = np.trapz(y_coordinates, x_coordinates)
-        auc_string = "AUC {:.5f}".format(auc)
-        logging.info(auc_string)
-        fd.write(auc_string + "\n")
+        acc_str = f"Accuracy: {accuracy:.4f}"
+        logging.info(acc_str)
+        fd.write(acc_str + "\n")
 
-        for i in range(0, x_coordinates.shape[0]):
-            cutoff_string = "Cutoff {:.2f}: frr={:.4f}; faph={:.3f}".format(
-                cutoffs_at_points[i], y_coordinates[i], x_coordinates[i]
-            )
-            logging.info(cutoff_string)
-            fd.write(cutoff_string + "\n")
-
-    return auc
-
+    return {"accuracy": accuracy}
 
 def tflite_model_accuracy(
     config,
@@ -1726,70 +1399,92 @@ def tflite_model_accuracy(
     tflite_model_name="stream_state_internal.tflite",
     accuracy_name="tflite_model_accuracy.txt",
 ):
-    # Cargar el modelo TFLite
+    """
+    Evalúa la precisión de un modelo TFLite siguiendo el flujo de tf_model_accuracy.
+
+    Args:
+        config (dict): Configuración de entrenamiento.
+        folder (str): Carpeta donde está el modelo.
+        audio_processor (FeatureHandler): Manejador de características.
+        data_set (str, optional): Conjunto de datos a evaluar. Default "testing".
+        tflite_model_name (str, optional): Nombre del archivo TFLite. Default "stream_state_internal.tflite".
+        accuracy_name (str, optional): Nombre del archivo de reporte. Default "tflite_model_accuracy.txt".
+
+    Returns:
+        dict: Contiene accuracy, reporte de clasificación y matriz de confusión.
+    """
+    class_names = get_classes(config)
+
+    # Cargar modelo TFLite
     model = Model(os.path.join(config["train_dir"], folder, tflite_model_name))
 
-    # Determinar la estrategia de truncamiento
+    # Estrategia de truncamiento
     truncation_strategy = "truncate_start"
     if data_set.endswith("ambient"):
         truncation_strategy = "none"
 
     # Obtener datos de prueba
-    test_fingerprints, test_ground_truth, _ = audio_processor.get_data(
+    test_x, test_y, _ = audio_processor.get_data(
         data_set,
         batch_size=config["batch_size"],
         features_length=config["spectrogram_length"],
         truncation_strategy=truncation_strategy,
     )
 
-    logging.info(f"Testing TFLite model on the {data_set} set")
+    y_true, y_pred = [], []
 
-    # Listas para almacenar etiquetas verdaderas y predicciones
-    y_true = []
-    y_pred = []
-    class_names = get_classes(config)
+    for i, sample in enumerate(test_x):
+        spectrogram = sample.astype(np.float32)
+        probs = model.predict_spectrogram(spectrogram)
+        if probs.ndim == 2:
+            # Promediar temporalmente si es necesario
+            probs = np.mean(probs, axis=0)
+        pred_class = int(np.argmax(probs))
+        y_pred.append(pred_class)
+        y_true.append(int(test_y[i]))
 
-    for i in range(len(test_fingerprints)):
-        spectrogram = test_fingerprints[i].astype(np.float32)
-        probabilities = model.predict_spectrogram(spectrogram)
-        print("Holaaaaaaaaaaaa")
-        predicted_class = np.argmax(probabilities[-1])  # Clase con mayor probabilidad
-        print(f"Clase predicha para la muestra {i}: {predicted_class}")
-
-        # Almacenar etiquetas verdaderas y predicciones
-        true_class = int(test_ground_truth[i])  # Convertir a entero si es necesario
-        y_true.append(true_class)
-        y_pred.append(predicted_class)
-
-        # Registro intermedio (opcional)
         if i % 1000 == 0 and i:
-            logging.info(f"Procesando muestra {i} de {len(test_fingerprints)}")
+            logging.info(f"Procesando muestra {i} de {len(test_x)}")
 
-    # Calcular la matriz de confusión
-    confusion_mat = confusion_matrix(y_true, y_pred)
-    print("Matriz de confusión:\n", confusion_mat)
-
-    class_names = get_classes(config)
+    # Calcular métricas
+    confusion_mat = confusion_matrix(y_true, y_pred)   
     plot_confusion_matrix(confusion_mat, class_names)
-
-    # Calcular métricas globales y por clase
-    metrics = compute_metrics_multiclass(confusion_mat)
-
-    # Guardar resultados
-    metrics_string = (
-        f"Accuracy: {metrics['accuracy']:.4f}\n"
-        f"Precisión macro: {metrics['precision_macro']:.4f}\n"
-        f"Recall macro: {metrics['recall_macro']:.4f}\n"
-        f"F1-score macro: {metrics['f1_score_macro']:.4f}"
+    
+    report = classification_report(
+        y_true, y_pred,
+        target_names=list(class_names.values()),
+        output_dict=True,
+        zero_division=0,
     )
-    logging.info(f"Final TFLite model on the {data_set} set:\n{metrics_string}")
+    accuracy = report["accuracy"]
+
+    # Guardar reporte y matriz
     path = os.path.join(config["train_dir"], folder)
     with open(os.path.join(path, accuracy_name), "wt") as fd:
-        fd.write(metrics_string + "\n")
-        fd.write("Matriz de confusión:\n")
+        fd.write(f"Accuracy: {accuracy:.4f}\n\n")
+        fd.write("Reporte de clasificación:\n")
+        for label in class_names.values():
+            if label in report:
+                m = report[label]
+                fd.write(
+                    f"{label}: precision={m['precision']:.4f}, recall={m['recall']:.4f}, f1={m['f1-score']:.4f}\n"
+                )
+
+        fd.write("\nMatriz de confusión:\n")
         np.savetxt(fd, confusion_mat, fmt="%d")
 
-    return metrics
+    # Visualizar matriz de confusión con la función moderna
+    plot_confusion_matrix(
+        confusion_mat,
+        class_names,
+        figsize=(10, 8),
+        cmap="Blues",
+        save_path=os.path.join(path, "confusion_matrix.png"),
+    )
+
+    logging.info(f"Accuracy final en {data_set}: {accuracy:.4f}")
+
+    return {"accuracy": accuracy, "report": report, "confusion_matrix": confusion_mat}
 ```
 
 ```train.py
@@ -1818,6 +1513,7 @@ import numpy as np
 import tensorflow as tf
 
 from tensorflow.python.util import tf_decorator
+from tensorflow.keras.utils import to_categorical
 
 
 @contextlib.contextmanager
@@ -1831,40 +1527,33 @@ def swap_attribute(obj, attr, temp_value):
     finally:
         setattr(obj, attr, original_value)
 
+def preprocess_data(set_data, num_classes):
+        batch_x, batch_y, _ = set_data
+        batch_x = np.array(batch_x).astype(np.float32)
+        batch_y = to_categorical(batch_y, num_classes=num_classes)
+        return batch_x, batch_y
 
 def validate_nonstreaming(config, data_processor, model, test_set):
     num_classes = config["num_classes"]
-    testing_fingerprints, testing_ground_truth, _ = data_processor.get_data(
+    val_set = data_processor.get_data(
         test_set,
         batch_size=config["batch_size"],
         features_length=config["spectrogram_length"],
         truncation_strategy="truncate_start",
     )
+    x_val, y_val = preprocess_data(val_set, num_classes)
 
     model.reset_metrics()
 
     result = model.evaluate(
-        testing_fingerprints,
-        testing_ground_truth,
+        x_val,
+        y_val,
         batch_size=1024,
         return_dict=True,
         verbose=0,
     )
 
-    metrics = {}
-    metrics["accuracy"] = result.get("accuracy", result.get("sparse_categorical_accuracy"))
-    metrics["loss"] = result.get("loss")
-    metrics["auc"] = result.get("auc")
-    # Campos legacy (para compatibilidad con tu código) — por ahora los dejamos por defecto
-    metrics["recall"] = None
-    metrics["precision"] = None
-    metrics["recall_at_no_faph"] = 0
-    metrics["cutoff_for_no_faph"] = 0
-    metrics["ambient_false_positives"] = 0
-    metrics["ambient_false_positives_per_hour"] = 0
-    metrics["average_viable_recall"] = 0
-
-    return metrics
+    return result
 
 
 def train(model, config, data_processor):
@@ -1885,280 +1574,278 @@ def train(model, config, data_processor):
         freq_mask_max_size_list = [5]
     if not (freq_mask_count_list := config.get("freq_mask_count")):
         freq_mask_count_list = [2]
-    if not (positive_class_weight_list := config.get("positive_class_weight")):
-        positive_class_weight_list = [1.0]
-    if not (negative_class_weight_list := config.get("negative_class_weight")):
-        negative_class_weight_list = [1.0]
-
-    # Ensure all training setting lists are as long as the training step iterations
-    def pad_list_with_last_entry(list_to_pad, desired_length):
-        while len(list_to_pad) < desired_length:
-            last_entry = list_to_pad[-1]
-            list_to_pad.append(last_entry)
-
-    training_step_iterations = len(training_steps_list)
-    pad_list_with_last_entry(learning_rates_list, training_step_iterations)
-    pad_list_with_last_entry(mix_up_prob_list, training_step_iterations)
-    pad_list_with_last_entry(freq_mix_prob_list, training_step_iterations)
-    pad_list_with_last_entry(time_mask_max_size_list, training_step_iterations)
-    pad_list_with_last_entry(time_mask_count_list, training_step_iterations)
-    pad_list_with_last_entry(freq_mask_max_size_list, training_step_iterations)
-    pad_list_with_last_entry(freq_mask_count_list, training_step_iterations)
-    pad_list_with_last_entry(positive_class_weight_list, training_step_iterations)
-    pad_list_with_last_entry(negative_class_weight_list, training_step_iterations)
-
-    loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False)
-    optimizer = tf.keras.optimizers.Adam()
-
+    
     num_classes = config["num_classes"]
+    batch_size = config["batch_size"]
+    train_dir = config["train_dir"]
 
+    loss = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
     metrics = [
-        tf.keras.metrics.SparseCategoricalCrossentropy(
-            name="acc"),
-        tf.keras.metrics.TopKCategoricalAccuracy(name="top1", k=1),
+        tf.keras.metrics.CategoricalAccuracy(name="accuracy"),
         tf.keras.metrics.TopKCategoricalAccuracy(name="top3", k=3),
-        tf.keras.metrics.AUC(name="auc"),
     ]
+    optimizer = tf.keras.optimizers.Adam()
 
     model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 
-    # We un-decorate the `tf.function`, it's very slow to manually run training batches
-    model.make_train_function()
-    _, model.train_function = tf_decorator.unwrap(model.train_function)
-
-    # Configure checkpointer and restore if available
-    checkpoint_directory = os.path.join(config["train_dir"], "restore/")
-    checkpoint_prefix = os.path.join(checkpoint_directory, "ckpt")
-    checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-    checkpoint.restore(tf.train.latest_checkpoint(checkpoint_directory))
+    checkpoint_dir = os.path.join(train_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Configure TensorBoard summaries
-    train_writer = tf.summary.create_file_writer(
-        os.path.join(config["summaries_dir"], "train")
-    )
-    validation_writer = tf.summary.create_file_writer(
-        os.path.join(config["summaries_dir"], "validation")
+    summary_writer = tf.summary.create_file_writer(
+        os.path.join(config["summaries_dir"])
     )
 
-    training_steps_max = np.sum(training_steps_list)
+    for i in range(len(training_steps_list)):
+        learning_rate = learning_rates_list[i]
+        mix_up_prob = mix_up_prob_list[i]
+        freq_mix_prob = freq_mix_prob_list[i]
+        time_mask_max_size = time_mask_max_size_list[i]
+        time_mask_count = time_mask_count_list[i]
+        freq_mask_max_size = freq_mask_max_size_list[i]
+        freq_mask_count = freq_mask_count_list[i]
+        break
 
-    best_minimization_quantity = 10000
-    best_maximization_quantity = 0.0
-    best_no_faph_cutoff = 1.0
+    model.optimizer.learning_rate.assign(learning_rate)
 
-    for training_step in range(1, training_steps_max + 1):
-        training_steps_sum = 0
-        for i in range(len(training_steps_list)):
-            training_steps_sum += training_steps_list[i]
-            if training_step <= training_steps_sum:
-                learning_rate = learning_rates_list[i]
-                mix_up_prob = mix_up_prob_list[i]
-                freq_mix_prob = freq_mix_prob_list[i]
-                time_mask_max_size = time_mask_max_size_list[i]
-                time_mask_count = time_mask_count_list[i]
-                freq_mask_max_size = freq_mask_max_size_list[i]
-                freq_mask_count = freq_mask_count_list[i]
-                positive_class_weight = positive_class_weight_list[i]
-                negative_class_weight = negative_class_weight_list[i]
-                break
+    augmentation_policy = {
+        "mix_up_prob": mix_up_prob,
+        "freq_mix_prob": freq_mix_prob,
+        "time_mask_max_size": time_mask_max_size,
+        "time_mask_count": time_mask_count,
+        "freq_mask_max_size": freq_mask_max_size,
+        "freq_mask_count": freq_mask_count,
+    }
 
-        model.optimizer.learning_rate.assign(learning_rate)
+    train_set = data_processor.get_data(
+        "training",
+        batch_size=batch_size,
+        features_length=config["spectrogram_length"],
+        truncation_strategy="truncate_start",
+        augmentation_policy=augmentation_policy,
+    )
 
-        augmentation_policy = {
-            "mix_up_prob": mix_up_prob,
-            "freq_mix_prob": freq_mix_prob,
-            "time_mask_max_size": time_mask_max_size,
-            "time_mask_count": time_mask_count,
-            "freq_mask_max_size": freq_mask_max_size,
-            "freq_mask_count": freq_mask_count,
-        }
+    x_train, y_train = preprocess_data(train_set, num_classes)
 
-        (
-            train_fingerprints,
-            train_ground_truth,
-            train_sample_weights,
-        ) = data_processor.get_data(
-            "training",
-            batch_size=config["batch_size"],
-            features_length=config["spectrogram_length"],
-            truncation_strategy="default",
-            augmentation_policy=augmentation_policy,
-        )
+    epochs = config.get("epochs", 5)
+    for epoch in range(1, epochs + 1):
+        print(f"\nEpoch {epoch}/{epochs}")
+        num_batches = len(x_train) // batch_size
 
-        class_weights = {idx: positive_class_weight if idx > 0 else negative_class_weight for idx in range(num_classes)}
-        train_sample_weights = np.array([class_weights[i] for i in train_ground_truth])
+        # Loop de batches
+        for i in range(num_batches):
+            bx = x_train[i * batch_size : (i + 1) * batch_size]
+            by = y_train[i * batch_size : (i + 1) * batch_size]
+            result = model.train_on_batch(bx, by, return_dict=True)
+            print(
+                f"Batch {i+1}/{num_batches} - "
+                + " - ".join([f"{k}: {v:.4f}" for k, v in result.items()]),
+                end="\r",
+            )
+
+        # Validación
+        val_result = validate_nonstreaming(config, data_processor, model, "validation")
+        print("\nValidation:", " - ".join([f"{k}: {v:.4f}" for k, v in val_result.items()]))
+
+        if epoch == 1 or val_result["accuracy"] >= best_val_acc:
+            best_val_acc = val_result["accuracy"]
+            model.save_weights(os.path.join(train_dir, "best_weights.weights.h5"))
+
+        # Guardar weights
+        model.save_weights(os.path.join(train_dir, "last_weights.weights.h5"))
+        model.save_weights(os.path.join(checkpoint_dir, f"epoch_{epoch:04d}.weights.h5"))
+
+        # Guardar en TensorBoard
+        with summary_writer.as_default():
+            tf.summary.scalar("train/loss", result["loss"], step=epoch)
+            tf.summary.scalar("train/accuracy", result["accuracy"], step=epoch)
+            tf.summary.scalar("val/loss", val_result["loss"], step=epoch)
+            tf.summary.scalar("val/accuracy", val_result["accuracy"], step=epoch)
+
+    final_path = os.path.join(train_dir, "final_model")
+    model.export(final_path)
+    print(f"\nModelo final guardado en {final_path}")
+
+
+        # train_ground_truth = np.array(train_ground_truth).astype(np.int32).reshape(-1,)
+        # train_ground_truth = to_categorical(train_ground_truth, num_classes=num_classes)
+        # print("Batch shapes:", train_fingerprints.shape, train_ground_truth.shape)
+
+
+        # class_weights = {idx: positive_class_weight if idx > 0 else negative_class_weight for idx in range(num_classes)}
+        # train_sample_weights = np.array([class_weights[np.argmax(i)] for i in train_ground_truth])
             
-        result = model.train_on_batch(
-            train_fingerprints,
-            train_ground_truth,
-            sample_weight=train_sample_weights,
-        )
+        # result = model.train_on_batch(
+        #     train_fingerprints,
+        #     train_ground_truth,
+        #     sample_weight=train_sample_weights,
+        # )
 
         # Mapear por nombre para ser robustos a cambios
-        if isinstance(result, (list, tuple)):
-            result_dict = dict(zip(model.metrics_names, result))
-        else:
-            # algunos TF devuelven solo un escalar (loss)
-            result_dict = {"loss": float(result)}
+        # if isinstance(result, (list, tuple)):
+        #     result_dict = dict(zip(model.metrics_names, result))
+        # else:
+        #     # algunos TF devuelven solo un escalar (loss)
+        #     result_dict = {"loss": float(result)}
 
-        loss_val = result_dict.get("loss", None)
-        accuracy_val = result_dict.get("accuracy", result_dict.get("sparse_categorical_accuracy", 0.0))
-        top1_val = result_dict.get("top1", 0.0)
-        top3_val = result_dict.get("top3", 0.0)
-        auc_val = result_dict.get("auc", 0.0)
+        # loss_val = result_dict.get("loss", None)
+        # accuracy_val = result_dict.get("accuracy", result_dict.get("sparse_categorical_accuracy", 0.0))
+        # top1_val = result_dict.get("top1", 0.0)
+        # top3_val = result_dict.get("top3", 0.0)
+        # auc_val = result_dict.get("auc", 0.0)
 
-        # Print the running statistics in the current validation epoch
-        print(
-            "Step {:d}: loss={:.4f}; acc={:.4f}; top1={:.4f}; top3={:.4f}; auc={:.4f}\r".format(
-                training_step, loss_val, accuracy_val, top1_val, top3_val, auc_val
-            ),
-            end="",
-        )
+        # # Print the running statistics in the current validation epoch
+        # print(
+        #     "Step {:d}: loss={:.4f}; acc={:.4f}; top1={:.4f}; top3={:.4f}; auc={:.4f}\r".format(
+        #         training_step, loss_val, accuracy_val, top1_val, top3_val, auc_val
+        #     ),
+        #     end="",
+        # )
 
-        is_last_step = training_step == training_steps_max
-        if (training_step % config["eval_step_interval"]) == 0 or is_last_step:
-            print(
-                "Step {:d}: loss={:.4f}; acc={:.4f}; top1={:.4f}; top3={:.4f}; auc={:.4f}\r".format(
-                    training_step, loss_val, accuracy_val, top1_val, top3_val, auc_val
-                ),
-                end="",
-            )
+        # is_last_step = training_step == training_steps_max
+        # if (training_step % config["eval_step_interval"]) == 0 or is_last_step:
+        #     print(
+        #         "Step {:d}: loss={:.4f}; acc={:.4f}; top1={:.4f}; top3={:.4f}; auc={:.4f}\r".format(
+        #             training_step, loss_val, accuracy_val, top1_val, top3_val, auc_val
+        #         ),
+        #         end="",
+        #     )
 
-            with train_writer.as_default():
-                tf.summary.scalar("loss", result[9], step=training_step)
-                tf.summary.scalar("accuracy", result[1], step=training_step)
-                tf.summary.scalar("recall", result[2], step=training_step)
-                tf.summary.scalar("precision", result[3], step=training_step)
-                tf.summary.scalar("auc", result[8], step=training_step)
-                train_writer.flush()
+        #     with train_writer.as_default():
+        #         tf.summary.scalar("loss", result[9], step=training_step)
+        #         tf.summary.scalar("accuracy", result[1], step=training_step)
+        #         tf.summary.scalar("recall", result[2], step=training_step)
+        #         tf.summary.scalar("precision", result[3], step=training_step)
+        #         tf.summary.scalar("auc", result[8], step=training_step)
+        #         train_writer.flush()
 
-            model.save_weights(
-                os.path.join(config["train_dir"], "last_weights.weights.h5")
-            )
+            # model.save_weights(
+            #     os.path.join(config["train_dir"], "last_weights.weights.h5")
+            # )
 
-            nonstreaming_metrics = validate_nonstreaming(
-                config, data_processor, model, "validation"
-            )
-            model.reset_metrics()  # reset metrics for next validation epoch of training
-            logging.info(
-                "Step %d (nonstreaming): Validation: recall at no faph = %.3f with cutoff %.2f, accuracy = %.2f%%, recall = %.2f%%, precision = %.2f%%, ambient false positives = %d, estimated false positives per hour = %.5f, loss = %.5f, auc = %.5f, average viable recall = %.9f",
-                *(
-                    training_step,
-                    nonstreaming_metrics["recall_at_no_faph"] * 100,
-                    nonstreaming_metrics["cutoff_for_no_faph"],
-                    nonstreaming_metrics["accuracy"] * 100,
-                    nonstreaming_metrics["recall"] * 100,
-                    nonstreaming_metrics["precision"] * 100,
-                    nonstreaming_metrics["ambient_false_positives"],
-                    nonstreaming_metrics["ambient_false_positives_per_hour"],
-                    nonstreaming_metrics["loss"],
-                    nonstreaming_metrics["auc"],
-                    nonstreaming_metrics["average_viable_recall"],
-                ),
-            )
+            # nonstreaming_metrics = validate_nonstreaming(
+            #     config, data_processor, model, "validation"
+            # )
+            # model.reset_metrics()  # reset metrics for next validation epoch of training
+            # logging.info(
+            #     "Step %d (nonstreaming): Validation: recall at no faph = %.3f with cutoff %.2f, accuracy = %.2f%%, recall = %.2f%%, precision = %.2f%%, ambient false positives = %d, estimated false positives per hour = %.5f, loss = %.5f, auc = %.5f, average viable recall = %.9f",
+            #     *(
+            #         training_step,
+            #         nonstreaming_metrics["recall_at_no_faph"] * 100,
+            #         nonstreaming_metrics["cutoff_for_no_faph"],
+            #         nonstreaming_metrics["accuracy"] * 100,
+            #         nonstreaming_metrics["recall"] * 100,
+            #         nonstreaming_metrics["precision"] * 100,
+            #         nonstreaming_metrics["ambient_false_positives"],
+            #         nonstreaming_metrics["ambient_false_positives_per_hour"],
+            #         nonstreaming_metrics["loss"],
+            #         nonstreaming_metrics["auc"],
+            #         nonstreaming_metrics["average_viable_recall"],
+            #     ),
+            # )
 
-            with validation_writer.as_default():
-                tf.summary.scalar(
-                    "loss", nonstreaming_metrics["loss"], step=training_step
-                )
-                tf.summary.scalar(
-                    "accuracy", nonstreaming_metrics["accuracy"], step=training_step
-                )
-                tf.summary.scalar(
-                    "recall", nonstreaming_metrics["recall"], step=training_step
-                )
-                tf.summary.scalar(
-                    "precision", nonstreaming_metrics["precision"], step=training_step
-                )
-                tf.summary.scalar(
-                    "recall_at_no_faph",
-                    nonstreaming_metrics["recall_at_no_faph"],
-                    step=training_step,
-                )
-                tf.summary.scalar(
-                    "auc",
-                    nonstreaming_metrics["auc"],
-                    step=training_step,
-                )
-                tf.summary.scalar(
-                    "average_viable_recall",
-                    nonstreaming_metrics["average_viable_recall"],
-                    step=training_step,
-                )
-                validation_writer.flush()
+    #         with validation_writer.as_default():
+    #             tf.summary.scalar(
+    #                 "loss", nonstreaming_metrics["loss"], step=training_step
+    #             )
+    #             tf.summary.scalar(
+    #                 "accuracy", nonstreaming_metrics["accuracy"], step=training_step
+    #             )
+    #             tf.summary.scalar(
+    #                 "recall", nonstreaming_metrics["recall"], step=training_step
+    #             )
+    #             tf.summary.scalar(
+    #                 "precision", nonstreaming_metrics["precision"], step=training_step
+    #             )
+    #             tf.summary.scalar(
+    #                 "recall_at_no_faph",
+    #                 nonstreaming_metrics["recall_at_no_faph"],
+    #                 step=training_step,
+    #             )
+    #             tf.summary.scalar(
+    #                 "auc",
+    #                 nonstreaming_metrics["auc"],
+    #                 step=training_step,
+    #             )
+    #             tf.summary.scalar(
+    #                 "average_viable_recall",
+    #                 nonstreaming_metrics["average_viable_recall"],
+    #                 step=training_step,
+    #             )
+    #             validation_writer.flush()
 
-            os.makedirs(os.path.join(config["train_dir"], "train"), exist_ok=True)
+    #         os.makedirs(os.path.join(config["train_dir"], "train"), exist_ok=True)
 
-            model.save_weights(
-                os.path.join(
-                    config["train_dir"],
-                    "train",
-                    f"{int(best_minimization_quantity * 10000)}_weights_{training_step}.weights.h5",
-                )
-            )
+    #         model.save_weights(
+    #             os.path.join(
+    #                 config["train_dir"],
+    #                 "train",
+    #                 f"{int(best_minimization_quantity * 10000)}_weights_{training_step}.weights.h5",
+    #             )
+    #         )
 
-            current_minimization_quantity = 0.0
-            if config["minimization_metric"] is not None:
-                current_minimization_quantity = nonstreaming_metrics[
-                    config["minimization_metric"]
-                ]
-            current_maximization_quantity = nonstreaming_metrics[
-                config["maximization_metric"]
-            ]
-            current_no_faph_cutoff = nonstreaming_metrics["cutoff_for_no_faph"]
+    #         current_minimization_quantity = 0.0
+    #         if config["minimization_metric"] is not None:
+    #             current_minimization_quantity = nonstreaming_metrics[
+    #                 config["minimization_metric"]
+    #             ]
+    #         current_maximization_quantity = nonstreaming_metrics[
+    #             config["maximization_metric"]
+    #         ]
+    #         current_no_faph_cutoff = nonstreaming_metrics["cutoff_for_no_faph"]
 
-            # Save model weights if this is a new best model
-            if (
-                (
-                    (
-                        current_minimization_quantity <= config["target_minimization"]
-                    )  # achieved target false positive rate
-                    and (
-                        (
-                            current_maximization_quantity > best_maximization_quantity
-                        )  # either accuracy improved
-                        or (
-                            best_minimization_quantity > config["target_minimization"]
-                        )  # or this is the first time we met the target
-                    )
-                )
-                or (
-                    (
-                        current_minimization_quantity > config["target_minimization"]
-                    )  # we haven't achieved our target
-                    and (
-                        current_minimization_quantity < best_minimization_quantity
-                    )  # but we have decreased since the previous best
-                )
-                or (
-                    (
-                        current_minimization_quantity == best_minimization_quantity
-                    )  # we tied a previous best
-                    and (
-                        current_maximization_quantity > best_maximization_quantity
-                    )  # and we increased our accuracy
-                )
-            ):
-                best_minimization_quantity = current_minimization_quantity
-                best_maximization_quantity = current_maximization_quantity
-                best_no_faph_cutoff = current_no_faph_cutoff
+    #         # Save model weights if this is a new best model
+    #         if (
+    #             (
+    #                 (
+    #                     current_minimization_quantity <= config["target_minimization"]
+    #                 )  # achieved target false positive rate
+    #                 and (
+    #                     (
+    #                         current_maximization_quantity > best_maximization_quantity
+    #                     )  # either accuracy improved
+    #                     or (
+    #                         best_minimization_quantity > config["target_minimization"]
+    #                     )  # or this is the first time we met the target
+    #                 )
+    #             )
+    #             or (
+    #                 (
+    #                     current_minimization_quantity > config["target_minimization"]
+    #                 )  # we haven't achieved our target
+    #                 and (
+    #                     current_minimization_quantity < best_minimization_quantity
+    #                 )  # but we have decreased since the previous best
+    #             )
+    #             or (
+    #                 (
+    #                     current_minimization_quantity == best_minimization_quantity
+    #                 )  # we tied a previous best
+    #                 and (
+    #                     current_maximization_quantity > best_maximization_quantity
+    #                 )  # and we increased our accuracy
+    #             )
+    #         ):
+    #             best_minimization_quantity = current_minimization_quantity
+    #             best_maximization_quantity = current_maximization_quantity
+    #             best_no_faph_cutoff = current_no_faph_cutoff
 
-                # overwrite the best model weights
-                model.save_weights(
-                    os.path.join(config["train_dir"], "best_weights.weights.h5")
-                )
-                checkpoint.save(file_prefix=checkpoint_prefix)
+    #             # overwrite the best model weights
+    #             model.save_weights(
+    #                 os.path.join(config["train_dir"], "best_weights.weights.h5")
+    #             )
+    #             checkpoint.save(file_prefix=checkpoint_prefix)
 
-            logging.info(
-                "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
-                best_minimization_quantity,
-                (best_maximization_quantity * 100),
-                best_no_faph_cutoff,
-            )
+    #         logging.info(
+    #             "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
+    #             best_minimization_quantity,
+    #             (best_maximization_quantity * 100),
+    #             best_no_faph_cutoff,
+    #         )
 
-    # Save checkpoint after training
-    checkpoint.save(file_prefix=checkpoint_prefix)
-    model.save_weights(os.path.join(config["train_dir"], "last_weights.weights.h5"))
+    # # Save checkpoint after training
+    # checkpoint.save(file_prefix=checkpoint_prefix)
+    # model.save_weights(os.path.join(config["train_dir"], "last_weights.weights.h5"))
 ```
 
 ```utils.py
@@ -2185,7 +1872,7 @@ import tensorflow as tf
 
 from absl import logging
 
-from microwakeword.layers import modes, stream, strided_drop
+from speech_commands.layers import modes, stream, strided_drop
 
 
 def _set_mode(model, mode):
@@ -2477,7 +2164,9 @@ def convert_saved_model_to_tflite(
         ] = 26.0  # guarantee one pixel is the preprocessor max
 
         for spectrogram in sample_fingerprints:
-            yield spectrogram
+            # Asegúrate de expandir dimensión batch si falta
+            spectrogram = np.expand_dims(spectrogram, axis=0).astype(np.float32)
+            yield [spectrogram]
 
         # stride = config["stride"]
 
@@ -2965,7 +2654,7 @@ import numpy as np
 
 from pathlib import Path
 
-from microwakeword.audio.audio_utils import remove_silence_webrtc
+from speech_commands.audio.audio_utils import remove_silence_webrtc
 
 
 class Clips:
@@ -3201,9 +2890,9 @@ class Clips:
 from typing import Optional
 import numpy as np
 
-from microwakeword.audio.audio_utils import generate_features_for_clip
-from microwakeword.audio.augmentation import Augmentation
-from microwakeword.audio.clips import Clips
+from speech_commands.audio.audio_utils import generate_features_for_clip
+from speech_commands.audio.augmentation import Augmentation
+from speech_commands.audio.clips import Clips
 
 
 class SpectrogramGeneration:
@@ -3416,7 +3105,7 @@ class AveragePooling2D(tf.keras.layers.Layer):
 
 """Dealy layer."""
 
-from microwakeword.layers import modes
+from speech_commands.layers import modes
 import tensorflow as tf
 
 
@@ -3623,704 +3312,6 @@ def get_input_data_shape(config, mode):
     return data_shape
 ```
 
-```stream.py
-# coding=utf-8
-# Copyright 2023 The Google Research Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Wrapper for streaming inference."""
-
-from absl import logging
-from microwakeword.layers import average_pooling2d
-from microwakeword.layers import modes
-import tensorflow as tf
-
-
-def frequeny_pad(inputs, dilation, stride, kernel_size):
-    """Pads input tensor in frequency domain.
-
-    Args:
-      inputs: input tensor
-      dilation: dilation in frequency dim
-      stride: stride in frequency dim
-      kernel_size: kernel_size in frequency dim
-
-    Returns:
-      padded tensor
-
-    Raises:
-      ValueError: if any of input rank is < 3
-    """
-
-    # expected input: [N, Time, Frequency, ...]
-    if inputs.shape.rank < 3:
-        raise ValueError("input_shape.rank:%d must be at least 3" % inputs.shape.rank)
-
-    kernel_size = (kernel_size - 1) * dilation + 1
-    total_pad = kernel_size - stride
-
-    pad_left = total_pad // 2
-    pad_right = total_pad - pad_left
-
-    pad = [[0, 0]] * inputs.shape.rank
-    pad[2] = [pad_left, pad_right]
-    return tf.pad(inputs, pad, "constant")
-
-
-class Stream(tf.keras.layers.Layer):
-    """Streaming wrapper - it is not a standalone layer.
-
-    It can be used to wrap Keras layer for streaming inference mode.
-    Advantage of streaming inference mode - it is more computationally efficient.
-    But not all layers are streamable. Some layers require keeping a buffer
-    with features in time. We can wrap such layer by Stream().
-    Where Stream() will create and keep a temporal buffer called state,
-    for both cases: internal state and external state.
-    Examples of layers which require temporal buffer/state
-    for streaming inference are Conv2D, DepthwiseConv2D, AveragePooling2D,
-    Flatten in time dimension, etc.
-
-    This wrapper is generic enough, so that it can be used for any modes:
-    1 Streaming with internal state. This wrapper will manage internal state.
-    2 Streaming with external state. Developer will have to manage external state
-    and feed it as additional input to the model and then receive output with
-    updated state.
-    3 Non streaming inference mode. In this case wrapper will just call
-    a wrapped layer as it is. There will be no difference in efficiency.
-    The graph will be the same as in training mode, but some training features
-    will be removed (such as dropout, etc)
-    4 Training mode.
-
-    Attributes:
-      cell: keras layer which has to be streamed or tf.identity
-      inference_batch_size: batch size in inference mode
-      mode: inference or training mode
-      pad_time_dim: padding in time: None, causal or same.
-        If 'same' then model will be non causal and developer will need to insert
-        a delay layer to emulate looking ahead effect. Also there will be edge
-        cases with residual connections. Demo of these is shown in delay_test.
-        If 'causal' then whole conversion to streaming mode is fully automatic.
-      state_shape:
-      ring_buffer_size_in_time_dim: size of ring buffer in time dim
-      use_one_step: True - model will run one sample per one inference step;
-        False - model will run multiple per one inference step.
-        It is useful for strided streaming
-      state_name_tag: name tag for streaming state
-      pad_freq_dim: type of padding in frequency dim: None or 'same'
-      transposed_conv_crop_output: this parameter is used for
-        transposed convolution only and will crop output tensor aligned by stride
-        in time dimension only - it is important for streaming of transposed conv
-      **kwargs: additional layer arguments
-
-    Raises:
-      ValueError: if padding is not 'valid' in streaming mode;
-                  or if striding is used with use_one_step;
-                  or cell is not supported
-    """
-
-    def __init__(
-        self,
-        cell,
-        inference_batch_size=1,
-        mode=modes.Modes.TRAINING,
-        pad_time_dim=None,
-        state_shape=None,
-        ring_buffer_size_in_time_dim=None,
-        use_one_step=True,
-        state_name_tag="ExternalState",
-        pad_freq_dim="valid",
-        transposed_conv_crop_output=True,
-        **kwargs,
-    ):
-        super(Stream, self).__init__(**kwargs)
-
-        if pad_freq_dim not in ["same", "valid"]:
-            raise ValueError(f"Unsupported padding in frequency, `{pad_freq_dim}`.")
-        if isinstance(cell, dict):
-            # Ensure deserialization of Keras layer prior to inference
-            cell = tf.keras.layers.deserialize(cell)
-
-        self.cell = cell
-        self.inference_batch_size = inference_batch_size
-        self.mode = mode
-        self.pad_time_dim = pad_time_dim
-        self.state_shape = state_shape
-        self.ring_buffer_size_in_time_dim = ring_buffer_size_in_time_dim
-        self.use_one_step = use_one_step
-        self.state_name_tag = state_name_tag
-        self.stride = 1
-        self.pad_freq_dim = pad_freq_dim
-        self.transposed_conv_crop_output = transposed_conv_crop_output
-
-        self.stride_freq = 1
-        self.dilation_freq = 1
-        self.kernel_size_freq = 1
-
-        wrapped_cell = self.get_core_layer()
-        # pylint: disable=pointless-string-statement
-        # pylint: disable=g-inconsistent-quotes
-        padding_error = "Cell padding must be 'valid'. Additional context: "
-        "keras does not support paddings in different dimensions, "
-        "but in some cases we need different paddings in time and feature dims. "
-        "Stream layer wraps conv cell and in streaming mode conv cell must use "
-        "'valid' padding only. That is why paddings are managed by Stream wrapper "
-        "with pad_time_dim and pad_freq_dim. pad_freq_dim is applied on dims with "
-        "index = 2. pad_time_dim is applied on dim 1: time dimension. "
-        # pylint: enable=g-inconsistent-quotes
-        # pylint: enable=pointless-string-statement
-
-        if not use_one_step and isinstance(
-            wrapped_cell,
-            (
-                tf.keras.layers.Flatten,
-                tf.keras.layers.GlobalMaxPooling2D,
-                tf.keras.layers.GlobalAveragePooling2D,
-            ),
-        ):
-            raise ValueError(
-                "Flatten, GlobalMaxPooling2D, GlobalAveragePooling2D "
-                "can be used only with use_one_step = True "
-                "because they are executed one time per inference call "
-                "and produce only one output in time dim, whereas conv "
-                "can produce multiple outputs in time dim, "
-                "so conv can be used with use_one_step = False or True"
-            )
-
-        if isinstance(wrapped_cell, tf.keras.layers.Conv2DTranspose):
-            padding = wrapped_cell.get_config()["padding"]
-            strides = wrapped_cell.get_config()["strides"]
-            self.stride = strides[0]
-            kernel_size = wrapped_cell.get_config()["kernel_size"]
-
-            if padding != "valid":
-                raise ValueError(padding_error)
-
-            # overlap in time domain defines ring buffer size
-            self.ring_buffer_size_in_time_dim = max(kernel_size[0] - strides[0], 0)
-        elif isinstance(
-            wrapped_cell,
-            (
-                tf.keras.layers.Conv1D,
-                tf.keras.layers.Conv2D,
-                tf.keras.layers.DepthwiseConv1D,
-                tf.keras.layers.DepthwiseConv2D,
-                tf.keras.layers.SeparableConv1D,
-                tf.keras.layers.SeparableConv2D,
-                average_pooling2d.AveragePooling2D,
-            ),
-        ):
-            padding = wrapped_cell.get_config()["padding"]
-            strides = wrapped_cell.get_config()["strides"]
-            self.stride = strides[0]
-
-            if self.mode not in (
-                modes.Modes.TRAINING,
-                modes.Modes.NON_STREAM_INFERENCE,
-            ):
-                if padding != "valid":
-                    raise ValueError(padding_error)
-
-            if self.mode not in (
-                modes.Modes.TRAINING,
-                modes.Modes.NON_STREAM_INFERENCE,
-            ):
-                if self.use_one_step:
-                    if strides[0] > 1:
-                        raise ValueError(
-                            "Stride in time dim greater than 1 "
-                            "in streaming mode with use_one_step=True "
-                            "is not supported, set use_one_step=False"
-                        )
-
-            dilation_rate = wrapped_cell.get_config()["dilation_rate"]
-            kernel_size = wrapped_cell.get_config()["kernel_size"]
-
-            # set parameters in frequency domain
-            self.stride_freq = strides[1] if len(strides) > 1 else strides
-            self.dilation_freq = (
-                dilation_rate[1] if len(dilation_rate) > 1 else dilation_rate
-            )
-            self.kernel_size_freq = (
-                kernel_size[1] if len(kernel_size) > 1 else kernel_size
-            )
-
-            if padding == "same" and self.pad_freq_dim == "same":
-                raise ValueError(
-                    "Cell padding and additional padding in frequency dim,"
-                    "can not be the same. In this case conv cell will "
-                    "pad both time and frequency dims and additional "
-                    "frequency padding will be applied due to "
-                    "pad_freq_dim"
-                )
-
-            if self.use_one_step:
-                # effective kernel size in time dimension
-                self.ring_buffer_size_in_time_dim = (
-                    dilation_rate[0] * (kernel_size[0] - 1) + 1
-                )
-            else:
-                # Streaming of strided or 1 step conv.
-                # Assuming input length is a multiple of strides (otherwise streaming
-                # conv is not meaningful), setting to this value (instead of
-                # dilation_rate[0] * (kernel_size[0] - 1)) ensures that we do not
-                # ignore the `strides - 1` rightmost (and hence most recent) valid
-                # input samples.
-                self.ring_buffer_size_in_time_dim = max(
-                    0, dilation_rate[0] * (kernel_size[0] - 1) - (strides[0] - 1)
-                )
-
-        elif isinstance(wrapped_cell, tf.keras.layers.AveragePooling2D):
-            strides = wrapped_cell.get_config()["strides"]
-            pool_size = wrapped_cell.get_config()["pool_size"]
-            self.stride = strides[0]
-            if (
-                self.mode
-                not in (modes.Modes.TRAINING, modes.Modes.NON_STREAM_INFERENCE)
-                and strides[0] != pool_size[0]
-            ):
-                raise ValueError(
-                    "Stride in time %d must = pool size in time %d"
-                    % (strides[0], pool_size[0])
-                )
-            # effective kernel size in time dimension
-            self.ring_buffer_size_in_time_dim = pool_size[0]
-
-        elif isinstance(
-            wrapped_cell,
-            (
-                tf.keras.layers.Flatten,
-                tf.keras.layers.GlobalMaxPooling2D,
-                tf.keras.layers.GlobalAveragePooling2D,
-            ),
-        ):
-            # effective kernel size in time dimension
-            if self.state_shape:
-                self.ring_buffer_size_in_time_dim = self.state_shape[1]
-        elif ring_buffer_size_in_time_dim is None:
-            raise ValueError("Cell is not supported ", wrapped_cell)
-
-        if ring_buffer_size_in_time_dim is not None:
-            # In a special case when `ring_buffer_size_in_time_dim` is specified
-            # outside of the layer, we overwrite the computed
-            # `self.ring_buffer_size_in_time_dim` with this specified value.
-            logging.warning(
-                "ring_buffer_size_in_time_dim overwritten by the "
-                "passed-in value: %d",
-                ring_buffer_size_in_time_dim,
-            )
-            self.ring_buffer_size_in_time_dim = ring_buffer_size_in_time_dim
-
-        if self.ring_buffer_size_in_time_dim == 1:
-            logging.warning(
-                "There is no need to use Stream on time dim with size 1: %s",
-                self.cell.name if hasattr(self.cell, "name") else self.cell,
-            )
-
-    def get_core_layer(self):
-        """Get core layer which can be wrapped by quantizer."""
-        core_layer = self.cell
-        # check two level of wrapping:
-        if isinstance(core_layer, tf.keras.layers.Wrapper):
-            core_layer = core_layer.layer
-        if isinstance(core_layer, tf.keras.layers.Wrapper):
-            core_layer = core_layer.layer
-        return core_layer
-
-    def stride(self):
-        return self.stride
-
-    def build(self, input_shape):
-        if not isinstance(input_shape, tf.TensorShape):
-            # Ensure input_shape is TensorShape
-            input_shape = tf.TensorShape(input_shape)
-        super(Stream, self).build(input_shape)
-
-        wrapped_cell = self.get_core_layer()
-        if isinstance(wrapped_cell, tf.keras.layers.Layer) and not wrapped_cell.built:
-            # Sometimes it's necessary to rebuild the inner layer e.g. when
-            # deserializing models for the TF Lite converter.
-
-            # NOTE: input_shape may correspond to an input matching a single streaming
-            # stride passed into the model. This can cause wrapped layers to fail --
-            # e.g. convolutions due to mismatch between kernel size and streaming
-            # dimension, as the implicit state concatenations are not simulated during
-            # construction. Solution is to set the streaming dimension as unspecified
-            faked_stream_dim_shape = input_shape.as_list()
-            faked_stream_dim_shape[1] = None
-            wrapped_cell.build(tf.TensorShape(faked_stream_dim_shape))
-
-        if isinstance(wrapped_cell, tf.keras.layers.Conv2DTranspose):
-            strides = wrapped_cell.get_config()["strides"]
-            kernel_size = wrapped_cell.get_config()["kernel_size"]
-            filters = wrapped_cell.get_config()["filters"]
-
-            # Only in streaming modes are these shapes and dimensions accessible.
-            if self.mode in [
-                modes.Modes.STREAM_INTERNAL_STATE_INFERENCE,
-                modes.Modes.STREAM_EXTERNAL_STATE_INFERENCE,
-            ]:
-                self.output_time_dim = input_shape.as_list()[1] * strides[0]
-
-                # here we do not take into account padding, because it is always valid
-                # only pad_time_dim can be applied and it does not impact feature dim
-                output_feature_size = (input_shape[2] - 1) * strides[1] + kernel_size[1]
-
-                # [batch, time dim(streaming dim), output_feature_size,
-                # channels/filters]
-                self.state_shape = [
-                    self.inference_batch_size,
-                    self.ring_buffer_size_in_time_dim,
-                    output_feature_size,
-                    filters,
-                ]
-        elif isinstance(
-            wrapped_cell,
-            (
-                tf.keras.layers.Conv1D,
-                tf.keras.layers.Conv2D,
-                tf.keras.layers.DepthwiseConv1D,
-                tf.keras.layers.DepthwiseConv2D,
-                tf.keras.layers.SeparableConv1D,
-                tf.keras.layers.SeparableConv2D,
-                tf.keras.layers.AveragePooling2D,
-            ),
-        ):
-            self.state_shape = [
-                self.inference_batch_size,
-                self.ring_buffer_size_in_time_dim,
-            ] + input_shape.as_list()[2:]
-        elif (
-            isinstance(
-                wrapped_cell,
-                (
-                    tf.keras.layers.Flatten,
-                    tf.keras.layers.GlobalMaxPooling2D,
-                    tf.keras.layers.GlobalAveragePooling2D,
-                ),
-            )
-            and not self.state_shape
-        ):
-            if self.mode in (modes.Modes.TRAINING, modes.Modes.NON_STREAM_INFERENCE):
-                # Only in the non-streaming modes we have access to the whole training
-                # sequence. In the streaming mode input_shape will not be available.
-                # During streaming inference we have access to one sample at a time!
-                # So we generate state shape based on input_shape during training.
-                # It will be stored in the layer config
-                # Then used by clone_streaming_model to create state buffer,
-                # during layer initialization.
-                # [batch, time, feature, ...]
-                self.state_shape = input_shape.as_list()
-                self.state_shape[0] = self.inference_batch_size
-        elif self.ring_buffer_size_in_time_dim:
-            # it is a special case when ring_buffer_size_in_time_dim
-            # is defined by user and cell is not defined in Stream wrapper
-            self.state_shape = [
-                self.inference_batch_size,
-                self.ring_buffer_size_in_time_dim,
-            ] + input_shape.as_list()[2:]
-
-        if self.mode == modes.Modes.STREAM_INTERNAL_STATE_INFERENCE:
-            # Create a state varaible for streaming inference mode (internal state).
-            # Where states become a weight in the layer
-            if self.ring_buffer_size_in_time_dim:
-                if self.pad_freq_dim == "same":
-                    # Additional padding value in frequency dimension
-                    # defined by above function: frequeny_pad().
-                    kernel_size = (self.kernel_size_freq - 1) * self.dilation_freq + 1
-                    total_pad = kernel_size - self.stride_freq
-                    output_feature_size = self.state_shape[2] + total_pad
-                    # Note: override first feature dimension with padded value.
-                    self.state_shape[2] = output_feature_size
-
-                self.states = self.add_weight(
-                    name="states",
-                    shape=self.state_shape,
-                    trainable=False,
-                    initializer=tf.zeros_initializer,
-                )
-
-        elif self.mode == modes.Modes.STREAM_EXTERNAL_STATE_INFERENCE:
-            # For streaming inference with extrnal states,
-            # the states are passed in as input.
-            if self.ring_buffer_size_in_time_dim:
-                if self.pad_freq_dim == "same":
-                    # Additional padding value in frequency dimension
-                    # defined by above function: frequeny_pad().
-                    kernel_size = (self.kernel_size_freq - 1) * self.dilation_freq + 1
-                    total_pad = kernel_size - self.stride_freq
-                    output_feature_size = self.state_shape[2] + total_pad
-                    # Note: override first feature dimension with padded value.
-                    self.state_shape[2] = output_feature_size
-                self.input_state = tf.keras.layers.Input(
-                    shape=self.state_shape[1:],
-                    batch_size=self.inference_batch_size,
-                    name=self.name + "/" + self.state_name_tag,
-                )  # adding names to make it unique
-            else:
-                self.input_state = None
-            self.output_state = None
-
-    def call(self, inputs):
-        # For streaming mode we may need different paddings in time
-        # and frequency dimensions. When we train streaming aware model it should
-        # have causal padding in time, and during streaming inference no padding
-        # in time applied. So conv kernel always uses 'valid' padding and we add
-        # causal padding in time during training. It is controlled
-        # by self.pad_time_dim. In addition we may need 'same' or
-        # 'valid' padding in frequency domain. For this case it has to be applied
-        # in both training and inference modes. That is why we introduced
-        # self.pad_freq_dim.
-        if self.pad_freq_dim == "same":
-            inputs = frequeny_pad(
-                inputs, self.dilation_freq, self.stride_freq, self.kernel_size_freq
-            )
-
-        if self.mode == modes.Modes.STREAM_INTERNAL_STATE_INFERENCE:
-            return self._streaming_internal_state(inputs)
-
-        elif self.mode == modes.Modes.STREAM_EXTERNAL_STATE_INFERENCE:
-            if self.ring_buffer_size_in_time_dim:
-                # in streaming inference mode with external state
-                # in addition to the output we return the output state.
-                output, self.output_state = self._streaming_external_state(
-                    inputs, self.input_state
-                )
-            else:
-                # if there is no ring buffer then the input_state isn't needed.
-                output = self.cell(inputs)
-            return output
-        elif self.mode in (modes.Modes.TRAINING, modes.Modes.NON_STREAM_INFERENCE):
-            # run non streamable training or non streamable inference
-            return self._non_streaming(inputs)
-
-        else:
-            raise ValueError(f"Encountered unexpected mode `{self.mode}`.")
-
-    def get_config(self):
-        config = super(Stream, self).get_config()
-        config.update(
-            {
-                "inference_batch_size": self.inference_batch_size,
-                "mode": self.mode,
-                "pad_time_dim": self.pad_time_dim,
-                "state_shape": self.state_shape,
-                "ring_buffer_size_in_time_dim": self.ring_buffer_size_in_time_dim,
-                "use_one_step": self.use_one_step,
-                "state_name_tag": self.state_name_tag,
-                "cell": self.cell,
-                "pad_freq_dim": self.pad_freq_dim,
-                "transposed_conv_crop_output": self.transposed_conv_crop_output,
-            }
-        )
-        return config
-
-    def get_input_state(self):
-        # input state will be used only for STREAM_EXTERNAL_STATE_INFERENCE mode
-        if self.mode == modes.Modes.STREAM_EXTERNAL_STATE_INFERENCE:
-            return [self.input_state]
-        else:
-            raise ValueError(
-                "Expected the layer to be in external streaming mode, "
-                f"not `{self.mode}`."
-            )
-
-    def get_output_state(self):
-        # output state will be used only for STREAM_EXTERNAL_STATE_INFERENCE mode
-        if self.mode == modes.Modes.STREAM_EXTERNAL_STATE_INFERENCE:
-            return [self.output_state]
-        else:
-            raise ValueError(
-                "Expected the layer to be in external streaming mode, "
-                f"not `{self.mode}`."
-            )
-
-    def _streaming_internal_state(self, inputs):
-        if isinstance(self.get_core_layer(), tf.keras.layers.Conv2DTranspose):
-            outputs = self.cell(inputs)
-
-            if self.ring_buffer_size_in_time_dim == 0:
-                if self.transposed_conv_crop_output:
-                    outputs = outputs[:, 0 : self.output_time_dim]
-                return outputs
-
-            output_shape = outputs.shape.as_list()
-
-            # need to add remainder state to a specific region of output as below:
-            # outputs[:,0:self.ring_buffer_size_in_time_dim,:] =
-            # outputs[:,0:self.ring_buffer_size_in_time_dim,:] + self.states
-            # but 'Tensor' object does not support item assignment,
-            # so doing it through full summation below
-            output_shape[1] -= self.state_shape[1]
-            padded_remainder = tf.concat(
-                [self.states, tf.zeros(output_shape, tf.float32)], 1
-            )
-            outputs = outputs + padded_remainder
-
-            # extract remainder state and subtract bias if it is used:
-            # bias will be added in the next iteration again and remainder
-            # should have only convolution part, so that bias is not added twice
-            if self.get_core_layer().get_config()["use_bias"]:
-                # need to access bias of the cell layer,
-                # where cell can be wrapped by wrapper layer
-                bias = self.get_core_layer().bias
-                new_state = (
-                    outputs[:, -self.ring_buffer_size_in_time_dim :, :] - bias
-                )  # pylint: disable=invalid-unary-operand-type
-            else:
-                new_state = outputs[
-                    :, -self.ring_buffer_size_in_time_dim :, :
-                ]  # pylint: disable=invalid-unary-operand-type
-            assign_states = self.states.assign(new_state)
-
-            with tf.control_dependencies([assign_states]):
-                if self.transposed_conv_crop_output:
-                    return tf.keras.layers.Identity()(outputs[:, 0 : self.output_time_dim, :])
-                else:
-                    return tf.keras.layers.Identity()(outputs)
-        else:
-            if self.use_one_step:
-                # The time dimenstion always has to equal 1 in streaming mode.
-                if inputs.shape[1] != 1:
-                    raise ValueError("inputs.shape[1]: %d must be 1 " % inputs.shape[1])
-
-                # remove latest row [batch_size, (memory_size-1), feature_dim, channel]
-                memory = self.states[:, 1 : self.ring_buffer_size_in_time_dim, :]
-
-                # add new row [batch_size, memory_size, feature_dim, channel]
-                memory = tf.keras.layers.concatenate([memory, inputs], 1)
-
-                assign_states = self.states.assign(memory)
-
-                with tf.control_dependencies([assign_states]):
-                    return self.cell(memory)
-            else:
-                # add new row [batch_size, memory_size, feature_dim, channel]
-                if self.ring_buffer_size_in_time_dim:
-                    memory = tf.keras.layers.concatenate([self.states, inputs], 1)
-
-                    state_update = memory[
-                        :, -self.ring_buffer_size_in_time_dim :, :
-                    ]  # pylint: disable=invalid-unary-operand-type
-
-                    assign_states = self.states.assign(state_update)
-
-                    with tf.control_dependencies([assign_states]):
-                        return self.cell(memory)
-                else:
-                    return self.cell(inputs)
-
-    def _streaming_external_state(self, inputs, state):
-        state = [] if state is None else state
-        if isinstance(self.get_core_layer(), tf.keras.layers.Conv2DTranspose):
-            outputs = self.cell(inputs)
-
-            if self.ring_buffer_size_in_time_dim == 0:
-                if self.transposed_conv_crop_output:
-                    outputs = outputs[:, 0 : self.output_time_dim, :]
-                return outputs, []
-
-            output_shape = outputs.shape.as_list()
-
-            output_shape[1] -= self.state_shape[1]
-            padded_remainder = tf.concat([state, tf.zeros(output_shape, tf.float32)], 1)
-            outputs = outputs + padded_remainder
-
-            if self.get_core_layer().get_config()["use_bias"]:
-                # need to access bias of the cell layer,
-                # where cell can be wrapped by wrapper layer
-                bias = self.get_core_layer().bias
-
-                new_state = (
-                    outputs[:, -self.ring_buffer_size_in_time_dim :, :] - bias
-                )  # pylint: disable=invalid-unary-operand-type
-            else:
-                new_state = outputs[
-                    :, -self.ring_buffer_size_in_time_dim :, :
-                ]  # pylint: disable=invalid-unary-operand-type
-
-            if self.transposed_conv_crop_output:
-                outputs = outputs[:, 0 : self.output_time_dim, :]
-            return outputs, new_state
-        else:
-            if self.use_one_step:
-                # The time dimenstion always has to equal 1 in streaming mode.
-                if inputs.shape[1] != 1:
-                    raise ValueError("inputs.shape[1]: %d must be 1 " % inputs.shape[1])
-
-                # remove latest row [batch_size, (memory_size-1), feature_dim, channel]
-                memory = state[:, 1 : self.ring_buffer_size_in_time_dim, :]
-
-                # add new row [batch_size, memory_size, feature_dim, channel]
-                memory = tf.keras.layers.concatenate([memory, inputs], 1)
-
-                output = self.cell(memory)
-                return output, memory
-            else:
-                # add new row [batch_size, memory_size, feature_dim, channel]
-                memory = tf.keras.layers.concatenate([state, inputs], 1)
-
-                state_update = memory[
-                    :, -self.ring_buffer_size_in_time_dim :, :
-                ]  # pylint: disable=invalid-unary-operand-type
-
-                output = self.cell(memory)
-                return output, state_update
-
-    def _non_streaming(self, inputs):
-        # transposed conv is a special case
-        if isinstance(self.get_core_layer(), tf.keras.layers.Conv2DTranspose):
-            outputs = self.cell(inputs)
-
-            # during training or non streaming inference, input shape can be dynamic
-            self.output_time_dim = tf.shape(inputs)[1] * self.stride
-            if self.transposed_conv_crop_output:
-                if self.pad_time_dim == "same":
-                    crop_left = self.ring_buffer_size_in_time_dim // 2
-                    return outputs[:, crop_left : crop_left + self.output_time_dim, :]
-                else:
-                    return outputs[:, 0 : self.output_time_dim, :]
-            else:
-                return outputs
-        else:
-            # Pad inputs in time dim: causal or same
-            if self.pad_time_dim:
-                if isinstance(
-                    self.cell,
-                    (
-                        tf.keras.layers.Flatten,
-                        tf.keras.layers.GlobalMaxPooling2D,
-                        tf.keras.layers.GlobalAveragePooling2D,
-                    ),
-                ):
-                    raise ValueError("pad_time_dim can not be used with Flatten")
-
-                # temporal padding
-                pad = [[0, 0]] * inputs.shape.rank
-                if self.use_one_step:
-                    pad_total_amount = self.ring_buffer_size_in_time_dim - 1
-                else:
-                    pad_total_amount = self.ring_buffer_size_in_time_dim
-                if self.pad_time_dim == "causal":
-                    pad[1] = [pad_total_amount, 0]
-                elif self.pad_time_dim == "same":
-                    half = pad_total_amount // 2
-                    pad[1] = [half, pad_total_amount - half]
-                inputs = tf.pad(inputs, pad, "constant")
-
-            return self.cell(inputs)
-```
-
 ```strided_drop.py
 # coding=utf-8
 # Copyright 2024 Kevin Ahrendt.
@@ -4339,7 +3330,7 @@ class Stream(tf.keras.layers.Layer):
 
 import tensorflow as tf
 
-from microwakeword.layers import modes
+from speech_commands.layers import modes
 
 
 class StridedDrop(tf.keras.layers.Layer):
@@ -4496,27 +3487,35 @@ class SubSpectralNormalization(tf.keras.layers.Layer):
 ```training_parameters.yaml
 batch_size: 128
 clip_duration_ms: 1500
+epochs: 300
 eval_step_interval: 500
 features:
 - features_dir: commands_augmented/negative/speech
   label: 0
   penalty_weight: 1.0
   sampling_weight: 10.0
-  truncation_strategy: truncate_end
+  truncation_strategy: random
   truth: false
   type: mmap
 - features_dir: commands_augmented/negative/dinner_party
   label: 0
   penalty_weight: 1.0
   sampling_weight: 10.0
-  truncation_strategy: truncate_end
+  truncation_strategy: random
   truth: false
   type: mmap
 - features_dir: commands_augmented/negative/no_speech
   label: 0
   penalty_weight: 1.0
   sampling_weight: 5.0
-  truncation_strategy: truncate_end
+  truncation_strategy: random
+  truth: false
+  type: mmap
+- features_dir: commands_augmented/negative/dinner_party_eval
+  label: 0
+  penalty_weight: 1.0
+  sampling_weight: 1.0
+  truncation_strategy: split
   truth: false
   type: mmap
 - features_dir: commands_augmented/commands/adelante
@@ -4586,6 +3585,17 @@ freq_mask_count:
 - 0
 freq_mask_max_size:
 - 0
+labels:
+  adelante: 1
+  atras: 2
+  derecha: 3
+  frena: 4
+  izquierda: 5
+  lento: 6
+  moderado: 7
+  negative: 0
+  rapido: 8
+  reversa: 9
 learning_rates:
 - 0.001
 maximization_metric: average_viable_recall
@@ -4606,7 +3616,7 @@ training_steps:
 window_step_ms: 10
 ```
 
-```model_train_eval.py
+```main.py
 # coding=utf-8
 # Copyright 2023 The Google Research Authors.
 # Modifications copyright 2024 Kevin Ahrendt.
@@ -4640,14 +3650,14 @@ if os.environ.get("CUDA_VISIBLE_DEVICES") == "-1" or (
 ):
     tf.config.set_visible_devices([], "GPU")
 
-import microwakeword.data as input_data
-import microwakeword.train as train
-import microwakeword.test as test
-import microwakeword.utils as utils
+import speech_commands.data as input_data
+import speech_commands.train as train
+import speech_commands.test as test
+import speech_commands.utils as utils
 
-import microwakeword.mixednet as mixednet
+import speech_commands.mixednet as mixednet
 
-from microwakeword.layers import modes
+from speech_commands.layers import modes
 
 
 def load_config(flags, model_module):
@@ -4832,32 +3842,6 @@ def evaluate_model(
             }
         )
 
-    if test_tflite_streaming:
-        tflite_configs.append(
-            {
-                "log_string": "streaming model",
-                "source_folder": "stream_state_internal",
-                "output_folder": "tflite_stream_state_internal",
-                "filename": "stream_state_internal.tflite",
-                "testing_dataset": "testing",
-                "testing_ambient_dataset": "testing_ambient",
-                "quantize": False,
-            }
-        )
-
-    if test_tflite_streaming_quantized:
-        tflite_configs.append(
-            {
-                "log_string": "quantized streaming model",
-                "source_folder": "stream_state_internal",
-                "output_folder": "tflite_stream_state_internal_quant",
-                "filename": "stream_state_internal_quant.tflite",
-                "testing_dataset": "testing",
-                "testing_ambient_dataset": "testing_ambient",
-                "quantize": True,
-            }
-        )
-
     for tflite_config in tflite_configs:
         logging.info("Converting %s to TFLite", tflite_config["log_string"])
 
@@ -4875,14 +3859,14 @@ def evaluate_model(
             tflite_config["log_string"],
         )
 
-        test.tflite_streaming_model_roc(
+        test.tflite_model_accuracy(
             config,
             tflite_config["output_folder"],
             data_processor,
             data_set=tflite_config["testing_dataset"],
-            ambient_set=tflite_config["testing_ambient_dataset"],
+            # ambient_set=tflite_config["testing_ambient_dataset"],
             tflite_model_name=tflite_config["filename"],
-            accuracy_name="tflite_streaming_roc.txt",
+            accuracy_name="tflite_model_accuracy.txt",
         )
 
 

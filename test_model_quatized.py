@@ -1,90 +1,75 @@
+# realtime_min.py
+import time
 import numpy as np
-import librosa.filters 
 import sounddevice as sd
-from ai_edge_litert.interpreter import Interpreter
-from speech_commands.inference import Model
-import matplotlib.pyplot as plt
+import yaml
 
-# Cargar el modelo TFLite
-# model_path = './trained/non_stream/saved_model.pb'
-model_path = './alexa.tflite'
-# model_path = './modelo_convertido.tflite'
-model = Model(model_path)
+from speech_commands.inference import Model  # tu wrapper con predict_clip
 
-# Configuración del audio
-sample_rate = 16000  # Tasa de muestreo
-block_size = 1024    # Tamaño del bloque
-max_duration = 2   # Duración máxima del buffer de audio (segundos)
-last_sample = sample_rate * max_duration
+# === Configuración básica ===
+MODEL_PATH   = "./trained/tflite_non_stream_quant/non_stream_quant.tflite"
+SAMPLE_RATE  = 16000           # Hz
+WINDOW_SEC   = 1.5             # segundos por inferencia (ajústalo si tu modelo usa otra ventana)
+BLOCK_SIZE   = 1024            # tamaño de bloque de captura
+CHANNELS     = 1
 
+model = Model(MODEL_PATH)
 
-# Buffer para almacenar características
-buffer_predictions = []
+# Orden de clases (debe coincidir con el modelo)
+CLASSES = [] 
+with open("./training_parameters.yaml", "rt") as f:
+    config = yaml.safe_load(f)
+    labels = config["labels"]
+    labels = dict(sorted(labels.items(), key=lambda item: item[1]))
+    CLASSES = list(labels.keys())
 
-# Nombres de las clases
-classes_names = [
-    "silencio",
-    "izquierda",
-    "reversa",
-    "atras",
-    "lento",
-    "frena",
-    "derecha",
-    "moderado",
-    "rapido",
-    "adelante"
-]
+print(CLASSES)
 
-# def audio_callback(indata, frames, time, status):
-#     """Callback para procesar cada bloque de audio."""
-#     global buffer_predictions
+# === Estado mínimo ===
+window_samples = int(round(WINDOW_SEC * SAMPLE_RATE))
+audio_buffer = np.zeros(window_samples, dtype=np.float32)
+audio_idx = 0
 
-#     if status:
-#         print(status)
-
-#     buffer_predictions = np.append(buffer_predictions, indata)
-
-#     if (len(buffer_predictions) > last_sample):
-#         audio_clip = buffer_predictions[:int(last_sample)]
-#         buffer_predictions = []
-
-#         prediction = model.predict_clip(audio_clip)
-#         # prediction = model.predict_clip(indata)
-#         print(np.sum(prediction), np.sum(prediction) > 0.5)
-#         # buffer_lenght = buffer_predictions.shape[0]
-
-#     # if (buffer_lenght >  ):
-#     # print(buffer_lenght)
-
-def audio_callback(indata, frames, time, status):
-    """Callback para procesar cada bloque de audio."""
-    global buffer_predictions
-
+def audio_callback(indata, frames, time_info, status):
+    global audio_buffer, audio_idx, model
     if status:
         print(status)
 
-    prediction = model.predict_clip(indata)
-    buffer_predictions = np.append(buffer_predictions, prediction)
+    mono = indata[:, 0].astype(np.float32, copy=False)
+    audio_idx += len(mono)
 
-    # if (len(buffer_predictions) > last_sample):
-    #     audio_clip = buffer_predictions[:int(last_sample)]
-    #     buffer_predictions = []
+    if mono.size >= audio_buffer.size:
+        audio_buffer[:] = mono[-audio_buffer.size:]
+    else:
+        audio_buffer = np.concatenate([audio_buffer[mono.size:], mono], axis=0)
+    
+    if audio_idx >= window_samples:
+        audio_idx = 0
+        preds = model.predict_clip(audio_buffer)   # (N, C)
+        if preds.shape[0] > 0:
+            probs = preds[-1]                     # toma el último chunk
+            idx = int(np.argmax(probs))
+            print(CLASSES[idx], float(probs[idx]))
 
-    #     prediction = model.predict_clip(audio_clip)
-    #     print(np.sum(prediction), np.sum(prediction) > 0.5)
 
-        
 
-buffer_predictions
-def start_stream():
-    print("Escuchando audio... Presiona Ctrl+C para detener.")
-    with sd.InputStream(callback=audio_callback, channels=1, samplerate=sample_rate, blocksize=block_size):
+def main():
+    # Carga modelo TFLite (no-stream)
+    assert hasattr(model, "predict_clip"), "El wrapper Model debe exponer predict_clip(wave)."
+
+    print("✅ Escuchando… (Ctrl+C para salir)")
+
+    with sd.InputStream(channels=CHANNELS,
+                        samplerate=SAMPLE_RATE,
+                        blocksize=BLOCK_SIZE,
+                        dtype="float32",
+                        callback=audio_callback):
         while True:
             sd.sleep(100)
 
 
 if __name__ == "__main__":
     try:
-        start_stream()
+        main()
     except KeyboardInterrupt:
-        print("\nStreaming detenido.")
+        print("\n🛑 Detenido por el usuario.")

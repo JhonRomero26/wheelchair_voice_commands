@@ -41,8 +41,6 @@ def get_classes(config):
     class_names = {i: inv[i] for i in range(max_idx + 1)}
     return class_names
 
-
-
 def plot_confusion_matrix(confusion_mat, class_names, figsize=(10, 8), cmap="Blues", save_path=None):
     """
     Visualiza la matriz de confusión de manera moderna con Seaborn.

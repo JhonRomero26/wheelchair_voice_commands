@@ -1,6 +1,6 @@
 batch_size: 128
 clip_duration_ms: 1500
-epochs: 300
+epochs: 50
 eval_step_interval: 500
 features:
 - features_dir: commands_augmented/negative/speech

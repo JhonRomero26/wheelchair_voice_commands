@@ -135,25 +135,45 @@ def train(model, config, data_processor):
         augmentation_policy=augmentation_policy,
     )
 
-    x_train, y_train = preprocess_data(train_set, num_classes)
+    total_train = data_processor.get_mode_size("training")
+    steps_full = max(1, total_train // batch_size)
+    max_steps_per_epoch = int(config.get("max_steps_per_epoch", 500))
+    steps_per_epoch = min(steps_full, max_steps_per_epoch)
+
+    best_val_acc = -1.0  # <-- inicializa
 
     epochs = config.get("epochs", 5)
     for epoch in range(1, epochs + 1):
         print(f"\nEpoch {epoch}/{epochs}")
-        num_batches = len(x_train) // batch_size
+        running = {"loss": 0.0, "accuracy": 0.0}
 
-        # Loop de batches
-        for i in range(num_batches):
-            bx = x_train[i * batch_size : (i + 1) * batch_size]
-            by = y_train[i * batch_size : (i + 1) * batch_size]
-            result = model.train_on_batch(bx, by, return_dict=True)
-            print(
-                f"Batch {i+1}/{num_batches} - "
-                + " - ".join([f"{k}: {v:.4f}" for k, v in result.items()]),
-                end="\r",
+        for step in range(steps_per_epoch):
+            # pide un NUEVO minibatch cada vez
+            train_set = data_processor.get_data(
+                "training",
+                batch_size=batch_size,
+                features_length=config["spectrogram_length"],
+                truncation_strategy="truncate_start",
+                augmentation_policy=augmentation_policy,
             )
+            bx, by = preprocess_data(train_set, num_classes)
+            result = model.train_on_batch(bx, by, return_dict=True)
 
-        # Validación
+            # promedio móvil simple para logging
+            running["loss"] += result["loss"]
+            running["accuracy"] += result["accuracy"]
+
+            if (step + 1) % max(1, steps_per_epoch // 5) == 0:
+                avg_loss = running["loss"] / (step + 1)
+                avg_acc = running["accuracy"] / (step + 1)
+                print(
+                    "Step {:d}/{:d}: loss={:.4f}; acc={:.4f}\r".format(
+                        step+1, steps_per_epoch, avg_loss, avg_acc
+                    ),
+                    end="",
+                )
+
+        # Validación completa
         val_result = validate_nonstreaming(config, data_processor, model, "validation")
         print("\nValidation:", " - ".join([f"{k}: {v:.4f}" for k, v in val_result.items()]))
 
@@ -161,11 +181,11 @@ def train(model, config, data_processor):
             best_val_acc = val_result["accuracy"]
             model.save_weights(os.path.join(train_dir, "best_weights.weights.h5"))
 
-        # Guardar weights
+        # Checkpoints de rutina
         model.save_weights(os.path.join(train_dir, "last_weights.weights.h5"))
         model.save_weights(os.path.join(checkpoint_dir, f"epoch_{epoch:04d}.weights.h5"))
 
-        # Guardar en TensorBoard
+        # TensorBoard
         with summary_writer.as_default():
             tf.summary.scalar("train/loss", result["loss"], step=epoch)
             tf.summary.scalar("train/accuracy", result["accuracy"], step=epoch)

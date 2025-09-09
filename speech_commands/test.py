@@ -22,7 +22,6 @@ import numpy as np
 import tensorflow as tf
 import seaborn as sns
 import matplotlib.pyplot as plt
-import yaml
 
 from absl import logging
 from typing import List
@@ -33,11 +32,13 @@ from sklearn.preprocessing import label_binarize
 
 
 def get_classes(config):
-    labels = config["labels"]
+    labels = dict(config["labels"])          # copia defensiva
     labels["Sin detección"] = 0
-    del labels["negative"]
-        
-    class_names = {v: k for k, v in labels.items()}
+    if "negative" in labels:
+        del labels["negative"]
+    inv = {v: k for k, v in labels.items()}
+    max_idx = max(inv.keys())
+    class_names = {i: inv[i] for i in range(max_idx + 1)}
     return class_names
 
 
@@ -139,6 +140,25 @@ def save_confusion_matrix(confusion_mat, class_names, file_path):
         for i, row in enumerate(confusion_mat):
             f.write(f"{class_labels[i]}\t" + "\t".join(map(str, row)) + "\n")
 
+def _extract_output(result):
+    # Adapta: Tensor, dict, lista/tupla
+    if isinstance(result, dict):
+        out = result.get("output", next(iter(result.values())))
+    elif isinstance(result, (list, tuple)):
+        out = result[0]
+    else:
+        out = result
+    return tf.convert_to_tensor(out)
+
+def _to_probs(y):
+    y = tf.convert_to_tensor(y)
+    # Si ya parece softmax (filas suman ~1 y max<=1), deja como está
+    row_sums = tf.reduce_sum(y, axis=-1, keepdims=True)
+    max_val = tf.reduce_max(y)
+    if max_val > 1.0 or not tf.reduce_all(tf.abs(row_sums - 1.0) < 1e-3):
+        y = tf.nn.softmax(y, axis=-1)
+    return y
+
 def tf_model_accuracy(
     config,
     folder,
@@ -167,22 +187,21 @@ def tf_model_accuracy(
         for i, sample in enumerate(test_x):
             tensor = tf.convert_to_tensor(sample[np.newaxis, ...], dtype=tf.float32)
             result = infer(tensor)
-            probs = result["output"].numpy()[0]
+            probs = _to_probs(_extract_output(result)).numpy()
             y_pred.append(np.argmax(probs))
             y_true.append(int(test_y[i]))
 
             if i % 1000 == 0 and i:
                 logging.info(f"Procesando muestra {i} de {len(test_x)}")
-
-    y_score = []
-    for sample in test_x:
-        spectrogram = sample.astype(np.float32)
-        probs = model.predict_spectrogram(spectrogram)
-        if probs.ndim == 2:
-            probs = np.mean(probs, axis=0)
-        y_score.append(probs)
+        
+        y_score = []
+        for sample in test_x:
+            tensor = tf.convert_to_tensor(sample[np.newaxis, ...], dtype=tf.float32)
+            result = infer(tensor)
+            probs = _to_probs(_extract_output(result)).numpy()[0]  # [num_classes]
+            y_score.append(probs)        
+        y_score = np.vstack(y_score)
     
-    y_score = np.array(y_score)
     plot_roc_curve(
         y_true, y_score,
         class_names,
@@ -212,9 +231,13 @@ def tf_model_accuracy(
                 fd.write(f"{label},{m['precision']:.4f},{m['recall']:.4f},{m['f1-score']:.4f}\n")
     
     with open(os.path.join(path, "confusion_matrix.csv"), "wt") as fd:
+        labels = list(class_names.values())
+        fd.write(",")
+        fd.write(",".join(labels) + "\n")
         for i in range(confusion_mat.shape[0]):
+            fd.write(f"{labels[i]},")
             for j in range(confusion_mat.shape[1]):
-                fd.write(f"{confusion_mat[i, j]} ")
+                fd.write(f"{confusion_mat[i, j]}{',' if j < confusion_mat.shape[1] - 1 else ''}")
             fd.write("\n")
         
     logging.info(f"Accuracy final en {data_set}: {accuracy:.4f}")

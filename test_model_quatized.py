@@ -1,5 +1,4 @@
 # realtime_min.py
-import time
 import numpy as np
 import sounddevice as sd
 import yaml
@@ -9,7 +8,7 @@ from speech_commands.inference import Model  # tu wrapper con predict_clip
 # === Configuración básica ===
 MODEL_PATH   = "./trained/tflite_non_stream_quant/non_stream_quant.tflite"
 SAMPLE_RATE  = 16000           # Hz
-WINDOW_SEC   = 1.5             # segundos por inferencia (ajústalo si tu modelo usa otra ventana)
+WINDOW_SEC   = 3             # segundos por inferencia (ajústalo si tu modelo usa otra ventana)
 BLOCK_SIZE   = 1024            # tamaño de bloque de captura
 CHANNELS     = 1
 
